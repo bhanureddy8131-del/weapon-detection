@@ -1,0 +1,23 @@
+numpy>=1.26
+pandas
+scipy
+scikit-learn
+matplotlib
+tqdm
+requests
+pillow
+pyyaml
+sympy
+networkx
+# Web / API
+fastapi
+uvicorn
+streamlit
+python-dotenv
+pydantic
+# Database
+sqlalchemy
+
+# Computer Vision & ML
+ultralytics
+supervision
