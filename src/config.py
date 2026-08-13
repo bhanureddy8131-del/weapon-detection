@@ -14,12 +14,12 @@ SERVER_URL = "http://localhost:8000/api/v1/incidents"
 
 # --- PARAMETERS ---
 WEBCAM_ID = 0
-CONFIDENCE_THRESHOLD = 0.4
+CONFIDENCE_THRESHOLD = 0.10
 ACTION_CONFIDENCE_THRESHOLD = 0.85 # Minimum confidence for LSTM action recognition
 SEQUENCE_LENGTH = 30  # Must match training
 
 DRAW_PERSON_BOXES = True # Draw bounding boxes for persons
-DRAW_LABELS = False # Draw text labels (ID, Class Name)
+DRAW_LABELS = True # Draw text labels (ID, Class Name)
 
 
 

@@ -1,97 +1,123 @@
 # SmartVision Pro - Real-Time Threat Detection
 
-SmartVision Pro is an advanced real-time computer vision system designed to detect potential security threats such as weapons (guns, knives) and violent actions (fighting, shooting) using a multi-stage pipeline.
+SmartVision Pro is an advanced real-time computer vision and machine learning platform designed to detect potential security threats such as weapons (guns, firearms, knives, blades), violent activities (fighting, shooting), and context-aware anomalies (ATM activity, unattended bags) using a multi-stage detection pipeline.
 
-##  Quick Start
+---
+
+## 🚀 Key Features
+
+- **Multi-Stage Detection Pipeline**: Integrates YOLO object detection with LSTM action recognition and MediaPipe pose estimation.
+- **Weapon & Tool Recognition**: Detects handguns, pistols, rifles, knives, blades, and suspicious objects in real-time.
+- **Action Recognition**: Uses skeleton pose dynamics over 30-frame temporal sequences to classify actions.
+- **Alert System**: Sends real-time security alerts via Telegram and Email with attached snapshot captures.
+- **Interactive Streamlit Dashboard**: Offers live video processing, incident history log, weapon/action toggle options, and custom video uploads.
+- **FastAPI Alert Server**: SQLite-backed backend serving alert data, static snapshot files, and REST API endpoints.
+
+---
+
+## ⚡ Quick Start
 
 ### 1. Prerequisites
 - **Python 3.11**
-- **Virtual Environment**: Expected at `env/` (see "Setup" below).
+- **Virtual Environment**: Pre-configured in `env/` or created locally.
 
-### 2. Run the Application
-We have provided a helper script to start both the **Backend Server** (for alerts) and the **Streamlit UI** (for visualization).
+### 2. Launch the Application
 
+#### On Windows (PowerShell / Command Prompt):
+```powershell
+.\start.ps1
+# or
+start.bat
+```
+
+#### On Linux / macOS:
 ```bash
 ./start.sh
 ```
 
-This will launch:
-- **Backend Server**: `http://localhost:8000`
-- **Dashboard UI**: `http://localhost:8501`
-
-*(Press `Ctrl+C` in the terminal to stop all services)*
+This launches both components simultaneously:
+- **Backend Server (FastAPI)**: `http://localhost:8000`
+- **Dashboard UI (Streamlit)**: `http://localhost:8501`
 
 ---
 
-##  Installation & Setup (First Time)
+## ⚙️ Setup & Installation (Manual Setup)
 
-If you have not set up the project yet, follow these steps:
-
-### 1. Project Setup
 ```bash
-# Clone the repository
-git clone <repo_url>
-cd smart-vision
+# 1. Clone the repository
+git clone https://github.com/Arunkoomath/wepondetection.git
+cd wepondetection
 
-# Create Virtual Environment
-python3 -m venv env
-
-# Activate Environment
+# 2. Create and activate virtual environment
+python -m venv env
+# On Windows:
+.\env\Scripts\activate
+# On Linux/macOS:
 source env/bin/activate
 
-# Install Dependencies (Choose your OS)
-# For macOS (Apple Silicon optimized):
-pip install -r environment/requirements-macos.txt
-
-# For Windows:
+# 3. Install dependencies
+# Windows:
 pip install -r environment/requirements-windows.txt
-```
-
-### 2. Verify Models
-Ensure your trained models are placed in the `models/` directory:
-- `models/yolo_fine_tune_v3.pt` (Object Detection)
-- `models/lstm_action_recognition_pro_v2.pth` (Action Recognition)
-
-### 3. Start the System
-```bash
-./start.sh
+# macOS:
+pip install -r environment/requirements-macos.txt
 ```
 
 ---
 
-##  Project Structure
+## 🏗️ System Architecture
 
 ```
 smart-vision/
 ├── data/
-│   ├── input_videos/       # Place video files here for processing
-│   ├── incidents.db        # SQLite database for alerts
-│   └── processed/          # Intermediate output
-├── env/                    # Virtual Environment
-├── environment/            # Requirement files (Mac/Win)
-├── logs/                   # System and Threat logs
-├── models/                 # ML Models (YOLO, LSTM)
+│   ├── input_videos/       # Input videos for processing
+│   ├── incidents.db        # SQLite database storing security incidents
+│   └── processed/          # Processed intermediate data
+├── env/                    # Virtual Python environment
+├── environment/            # Platform-specific requirements files
+├── logs/                   # System and threat event logs
+├── models/                 # Model files (YOLO, LSTM weights)
 ├── pipeline/
-│   ├── app.py              # Streamlit Dashboard Entry Point
-│   └── run_inference.py    # Core ML Inference Logic
+│   ├── app.py              # Streamlit Web Dashboard
+│   └── run_inference.py    # Core Multi-Stage Inference Engine
 ├── server/
-│   ├── main.py             # FastAPI Backend Entry Point
-│   └── config.py           # Configuration
-├── start.sh                # One-click startup script
-└── results/                # Processed video output
+│   ├── main.py             # FastAPI Server & REST API endpoints
+│   ├── models.py           # SQLAlchemy database schemas
+│   ├── schemas.py          # Pydantic data validation schemas
+│   └── services/           # Email & Telegram notification services
+├── src/
+│   ├── config.py           # Main configuration file (thresholds, options)
+│   ├── modeling/           # YOLO detectors, LSTM action models, MediaPipe estimators
+│   └── utils/              # Helper utilities
+├── start.bat               # Windows Batch startup script
+├── start.ps1               # Windows PowerShell startup script
+├── start.sh                # Unix/Linux/macOS startup script
+└── yolo11s.pt              # Fallback YOLO detection model
 ```
 
-##  Usage Guide
+---
 
-### Dashboard (UI)
-- **Live Dashboard**: Shows the real-time processed video feed.
-- **Alert History**: View past threat alerts saved in the database.
-- **Input Source**: Select "Live Webcam" or upload a video file via the sidebar.
+## 📡 API Endpoints (FastAPI Backend)
 
-### Input Modes
-- **Video Files**: Place `.mp4` files in `data/input_videos/`. The pipeline will process them automatically.
-- **Webcam**: If no files are selected, the system defaults to the webcam.
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/` | Health check endpoint (`{"status": "running"}`) |
+| `GET` | `/api/v1/incidents` | List recent incident alerts |
+| `POST` | `/api/v1/incidents` | Create a new threat incident alert & trigger notifications |
+| `GET` | `/static/alerts/{filename}` | Retrieve snapshot images attached to alert incidents |
 
-##  Notes
-- **Performance**: Runs best on machines with GPU support (CUDA/MPS).
-- **Security**: The `incidents.db` stores sensitive alert data locally.
+---
+
+## 🔧 Configuration Options (`src/config.py`)
+
+- `CONFIDENCE_THRESHOLD`: Object detection confidence threshold (default: `0.10`).
+- `ACTION_CONFIDENCE_THRESHOLD`: Minimum confidence for action recognition (default: `0.85`).
+- `DRAW_PERSON_BOXES`: Enable bounding box overlays for detected persons.
+- `DRAW_LABELS`: Enable text labels for detections.
+- `SERVER_URL`: Backend endpoint for posting incidents (`http://localhost:8000/api/v1/incidents`).
+
+---
+
+## 🛡️ License & Acknowledgments
+
+Developed as part of the SmartVision real-time computer vision security platform.
+

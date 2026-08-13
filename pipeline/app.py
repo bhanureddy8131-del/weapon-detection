@@ -233,15 +233,19 @@ def show_alert_history():
 
 
 def run_streamlit_inference_page():
-    # This was the old 'main' logic for the dashboard
+    st.title("🛡️ SmartVision Pro - Live Dashboard")
     st.sidebar.title("Configuration")
 
     runtime = init_models_and_helpers()
     if runtime is None or runtime["detector"] is None:
-        st.error(" YOLO/LSTM models not found. Check configuration.")
+        st.error("❌ YOLO/LSTM models not found. Check configuration.")
         return
 
-    st.sidebar.success("Models Loaded!")
+    st.sidebar.success("✅ Models Loaded!")
+
+    if st.sidebar.button("🔄 Reload Model & Settings"):
+        st.cache_resource.clear()
+        st.rerun()
 
     input_option = st.sidebar.selectbox(
         "Select Input Source",
@@ -252,7 +256,7 @@ def run_streamlit_inference_page():
 
     if input_option == "Live Webcam":
         source_path = WEBCAM_ID
-        st.info("Using Live Webcam. Click 'Start' in sidebar.")
+        st.info("👈 **Selected Source**: Live Webcam. Click **'▶️ Start Inference'** in the sidebar to launch detection.")
 
     elif input_option == "Select from Input Folder":
         if os.path.exists(INPUT_VIDEO_DIR):
@@ -264,10 +268,11 @@ def run_streamlit_inference_page():
             if video_files:
                 selected_file = st.sidebar.selectbox("Choose a video:", video_files)
                 source_path = os.path.join(INPUT_VIDEO_DIR, selected_file)
+                st.info(f"👈 **Selected Video**: `{selected_file}`. Click **'▶️ Start Inference'** in the sidebar to launch detection.")
             else:
-                st.sidebar.warning("No videos found in input folder.")
+                st.warning("No videos found in input folder (`data/input_videos`). You can upload a video or select Live Webcam in the sidebar.")
         else:
-            st.sidebar.error(f"Input folder {INPUT_VIDEO_DIR} does not exist.")
+            st.error(f"Input folder `{INPUT_VIDEO_DIR}` does not exist.")
 
     elif input_option == "Upload Video":
         uploaded_file = st.sidebar.file_uploader(
@@ -277,6 +282,9 @@ def run_streamlit_inference_page():
             tfile = tempfile.NamedTemporaryFile(delete=False)
             tfile.write(uploaded_file.read())
             source_path = tfile.name
+            st.success("✅ Video uploaded successfully! Click **'▶️ Start Inference'** in the sidebar to launch detection.")
+        else:
+            st.info("👈 **Upload Video**: Use the file uploader in the sidebar to select a video file.")
 
     if st.sidebar.button("▶️ Start Inference", type="primary"):
         if source_path is not None:

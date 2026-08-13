@@ -1,5 +1,5 @@
-# PowerShell Startup Script for SmartVision Pro
-$PythonExe = "env\Scripts\python.exe"
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$PythonExe = Join-Path $ScriptDir "env\Scripts\python.exe"
 
 if (-not (Test-Path $PythonExe)) {
     Write-Host "Error: Virtual environment not found at $PythonExe" -ForegroundColor Red

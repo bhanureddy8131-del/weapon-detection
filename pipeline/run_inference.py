@@ -105,7 +105,22 @@ CANONICAL_NAME_MAP = {
     "person": PERSON_CLASS_ID,
     "gun": GUN_CLASS_IDS[0],
     "firearm": GUN_CLASS_IDS[0],
+    "handgun": GUN_CLASS_IDS[0],
+    "pistol": GUN_CLASS_IDS[0],
+    "rifle": GUN_CLASS_IDS[0],
     "knife": KNIFE_CLASS_ID,
+    "scissors": KNIFE_CLASS_ID,
+    "fork": KNIFE_CLASS_ID,
+    "spoon": KNIFE_CLASS_ID,
+    "blade": KNIFE_CLASS_ID,
+    "dagger": KNIFE_CLASS_ID,
+    "sword": KNIFE_CLASS_ID,
+    "toothbrush": KNIFE_CLASS_ID,
+    "remote": KNIFE_CLASS_ID,
+    "cell phone": KNIFE_CLASS_ID,
+    "bottle": KNIFE_CLASS_ID,
+    "vase": KNIFE_CLASS_ID,
+    "baseball bat": KNIFE_CLASS_ID,
     "atm": ATM_CLASS_ID,
     "backpack": BACKPACK_CLASS_ID,
     "handbag": HANDBAG_CLASS_ID,
@@ -148,7 +163,7 @@ def parse_detections(detector: YOLODetector, results) -> Tuple[List, List[int]]:
 
 def draw_weapon_boxes(detector: YOLODetector, frame: np.ndarray, results) -> List[Dict]:
     """
-    Draw bounding boxes for weapons and context objects (ATM, Bags) and return detailed detection list.
+    Draw bounding boxes for weapons, context objects, and any detected non-person items.
     """
     visible_objects: List[Dict] = []
 
@@ -157,35 +172,41 @@ def draw_weapon_boxes(detector: YOLODetector, frame: np.ndarray, results) -> Lis
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             raw_cls_id = int(box.cls[0])
             conf = float(box.conf[0])
-            cls_id = get_canonical_class_id(detector, raw_cls_id)
+            
+            class_name = detector.class_names.get(raw_cls_id, "Unknown") if detector.class_names else "Unknown"
+            
+            # Skip person boxes (handled by tracking loop)
+            if class_name.lower() == "person":
+                continue
 
-            if (cls_id in WEAPON_CLASS_IDS) or (cls_id in CONTEXT_CLASS_IDS):
-                class_name = detector.class_names.get(raw_cls_id, "Unknown") if detector.class_names else "Unknown"
-                
-                # Append detailed info
-                visible_objects.append({
-                    "class": class_name,
-                    "class_id": cls_id,
-                    "confidence": conf,
-                    "bbox": [x1, y1, x2, y2]
-                })
-                
-                color = get_color(cls_id)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                
-                if DRAW_LABELS:
-                    label = f"{class_name}"
-                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                    cv2.rectangle(frame, (x1, y1 - 25), (x1 + tw, y1), color, -1)
-                    cv2.putText(
-                        frame,
-                        label,
-                        (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (255, 255, 255),
-                        2,
-                    )
+            cls_id = get_canonical_class_id(detector, raw_cls_id)
+            
+            # If object is not an ATM or Bag, treat any detected object as a potential weapon threat
+            if cls_id not in CONTEXT_CLASS_IDS:
+                cls_id = KNIFE_CLASS_ID
+
+            visible_objects.append({
+                "class": class_name,
+                "class_id": cls_id,
+                "confidence": conf,
+                "bbox": [x1, y1, x2, y2]
+            })
+            
+            color = (0, 0, 255) if cls_id in WEAPON_CLASS_IDS else get_color(cls_id)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            
+            label = f"{class_name.upper()} ({conf:.2f})"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(frame, (max(0, x1), max(25, y1 - 25)), (max(0, x1) + tw, max(25, y1)), color, -1)
+            cv2.putText(
+                frame,
+                label,
+                (max(0, x1), max(20, y1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+            )
 
     return visible_objects
 

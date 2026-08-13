@@ -11,8 +11,8 @@ class YOLODetector(BaseDetector):
 
     def load_model(self, model_path):
         if not os.path.exists(model_path) or os.path.getsize(model_path) < 10000:
-            print(f" Custom model file at {model_path} missing or Git LFS pointer. Falling back to 'yolo11n.pt'...")
-            model_path = "yolo11n.pt"
+            print(f" Custom model file at {model_path} missing or Git LFS pointer. Falling back to 'yolo11s.pt'...")
+            model_path = "yolo11s.pt"
 
         print(f" Loading YOLO model from: {model_path}...")
         try:
