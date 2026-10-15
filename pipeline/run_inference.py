@@ -198,6 +198,25 @@ def _passes_confidence_threshold(
     return confidence >= threshold
 
 
+def _validated_box_coordinates(raw_coordinates, image_shape=None):
+    try:
+        coordinates = np.asarray(raw_coordinates, dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if coordinates.shape != (4,) or not np.isfinite(coordinates).all():
+        return None
+
+    if image_shape is not None:
+        image_height, image_width = image_shape[:2]
+        coordinates[[0, 2]] = np.clip(coordinates[[0, 2]], 0, image_width - 1)
+        coordinates[[1, 3]] = np.clip(coordinates[[1, 3]], 0, image_height - 1)
+
+    x1, y1, x2, y2 = coordinates
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [int(round(value)) for value in coordinates]
+
+
 # Only map labels that genuinely correspond to the project's
 # weapon/context categories. Do not classify every object as a weapon.
 CANONICAL_NAME_MAP = {
@@ -264,11 +283,20 @@ def parse_detections(
             continue
 
         for box in result.boxes:
-            coords = box.xyxy[0].tolist()
-            x1, y1, x2, y2 = map(int, coords)
-
-            confidence = float(box.conf[0])
-            raw_class_id = int(box.cls[0])
+            coordinates = _validated_box_coordinates(box.xyxy[0].tolist())
+            if coordinates is None:
+                continue
+            try:
+                x1, y1, x2, y2 = coordinates
+                confidence = float(box.conf[0])
+                raw_class_value = float(box.cls[0])
+                if not np.isfinite(confidence) or not np.isfinite(raw_class_value):
+                    continue
+                if not raw_class_value.is_integer():
+                    continue
+                raw_class_id = int(raw_class_value)
+            except (TypeError, ValueError, IndexError):
+                continue
 
             if not _passes_confidence_threshold(
                 detector,
@@ -319,13 +347,23 @@ def draw_weapon_boxes(
             continue
 
         for box in result.boxes:
-            x1, y1, x2, y2 = map(
-                int,
+            coordinates = _validated_box_coordinates(
                 box.xyxy[0].tolist(),
+                frame.shape,
             )
-
-            raw_class_id = int(box.cls[0])
-            confidence = float(box.conf[0])
+            if coordinates is None:
+                continue
+            try:
+                x1, y1, x2, y2 = coordinates
+                raw_class_value = float(box.cls[0])
+                confidence = float(box.conf[0])
+                if not np.isfinite(confidence) or not np.isfinite(raw_class_value):
+                    continue
+                if not raw_class_value.is_integer():
+                    continue
+                raw_class_id = int(raw_class_value)
+            except (TypeError, ValueError, IndexError):
+                continue
 
             if not _passes_confidence_threshold(
                 detector,
@@ -425,16 +463,6 @@ def update_person_history(
     image_height, image_width = frame.shape[:2]
     threat_messages = []
 
-    tracked_ids = getattr(tracked_objects, "tracker_id", None)
-    active_track_ids = (
-        {int(track_id) for track_id in tracked_ids}
-        if tracked_ids is not None
-        else set()
-    )
-    for track_id in list(person_history):
-        if track_id not in active_track_ids:
-            del person_history[track_id]
-
     if len(tracked_objects) == 0:
         return threat_messages
 
@@ -451,7 +479,10 @@ def update_person_history(
             tracked_objects.xyxy[index],
         )
 
-        track_id = int(tracked_objects.tracker_id[index])
+        track_id_value = _coerce_track_id(tracked_objects.tracker_id[index])
+        if track_id_value is None:
+            continue
+        track_id = track_id_value
 
         confidence_values = getattr(
             tracked_objects,
@@ -481,10 +512,20 @@ def update_person_history(
         landmarks_list = None
 
         pose_started = time.perf_counter()
-        if lstm_model is not None and person_crop.size > 0:
-            landmarks_list, _ = pose_estimator.predict(
-                person_crop
-            )
+        if (
+            lstm_model is not None
+            and pose_estimator is not None
+            and getattr(pose_estimator, "available", True)
+            and person_crop.size > 0
+        ):
+            try:
+                landmarks_list, _ = pose_estimator.predict(person_crop)
+            except Exception:
+                logger.exception(
+                    "Pose inference failed for person track %s; "
+                    "the action sequence will be reset.",
+                    track_id,
+                )
         if stage_timings is not None:
             stage_timings["mediapipe"] = (
                 stage_timings.get("mediapipe", 0.0)
@@ -619,6 +660,53 @@ def update_person_history(
     return threat_messages
 
 
+def _coerce_track_id(value):
+    try:
+        numeric_id = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric_id) or numeric_id < 0 or not numeric_id.is_integer():
+        return None
+    return int(numeric_id)
+
+
+def _maintain_track_history(
+    tracked_objects,
+    person_history,
+    state_data,
+    tracker,
+):
+    tracker_ids = getattr(tracked_objects, "tracker_id", None)
+    active_track_ids = set()
+    if tracker_ids is not None:
+        active_track_ids = {
+            track_id
+            for value in tracker_ids
+            if (track_id := _coerce_track_id(value)) is not None
+        }
+
+    missed_frames = state_data.setdefault("missed_track_frames", {})
+    tracker_impl = getattr(tracker, "tracker", None)
+    retention_frames = max(
+        1,
+        int(getattr(tracker_impl, "max_time_lost", 1)),
+    )
+
+    for track_id in list(person_history):
+        if track_id in active_track_ids:
+            missed_frames.pop(track_id, None)
+            continue
+
+        sequence = person_history[track_id]
+        if hasattr(sequence, "clear"):
+            sequence.clear()
+        missed_frames[track_id] = missed_frames.get(track_id, 0) + 1
+        if missed_frames[track_id] > retention_frames:
+            person_history.pop(track_id, None)
+            state_data.get("person_durations", {}).pop(track_id, None)
+            missed_frames.pop(track_id, None)
+
+
 # ---------------------------------------------------------------------
 # FRAME PROCESSING
 # ---------------------------------------------------------------------
@@ -661,6 +749,7 @@ def process_frame(
     state_data.setdefault("unattended_bag_timer", 0.0)
     state_data.setdefault("frame_count", 0)
     state_data.setdefault("person_detections", [])
+    state_data.setdefault("missed_track_frames", {})
     base_confidence_threshold = (
         CONFIDENCE_THRESHOLD
         if confidence_threshold is None
@@ -720,6 +809,13 @@ def process_frame(
         detections_for_tracking
     )
     stage_timings["bytetrack"] = (time.perf_counter() - stage_started) * 1000
+
+    _maintain_track_history(
+        tracked_objects,
+        person_history,
+        state_data,
+        tracker,
+    )
 
     person_count = len(tracked_objects)
 
@@ -976,6 +1072,9 @@ def _run_single_source_offline(
     person_history,
 ):
     """Read a video or webcam, process frames, and save output."""
+
+    tracker.reset()
+    person_history.clear()
 
     is_webcam = source_path == WEBCAM_ID
 

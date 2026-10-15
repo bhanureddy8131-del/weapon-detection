@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
@@ -19,7 +20,11 @@ from src.modeling.classifiers.lstm import (
     load_action_model_from_checkpoint,
     predict_action,
 )
-from pipeline.run_inference import process_frame, update_person_history
+from pipeline.run_inference import (
+    _maintain_track_history,
+    process_frame,
+    update_person_history,
+)
 
 
 SEQUENCE_LENGTH = 30
@@ -79,27 +84,49 @@ class PoseSequenceBufferTests(unittest.TestCase):
         self.assertFalse(sequence.append([float("nan")] * POSE_FEATURE_SIZE))
         self.assertEqual(len(sequence), 0)
 
-    def test_old_track_history_is_removed_before_processing(self):
+    def test_missing_track_retains_id_but_resets_pose_sequence_until_expiry(self):
         sequence = PoseSequenceBuffer(SEQUENCE_LENGTH)
         for _ in range(SEQUENCE_LENGTH):
             sequence.append([0.1] * POSE_FEATURE_SIZE)
         person_history = {91: sequence}
-
-        update_person_history(
-            pose_estimator=None,
-            frame=np.zeros((16, 16, 3), dtype=np.uint8),
-            tracked_objects=[],
-            person_history=person_history,
-            device="cpu",
-            lstm_model=Mock(),
-            inv_class_map={},
-            threat_manager=None,
-            context_detections=[],
-            person_durations={},
-            is_unattended_bag=False,
+        state_data = {"person_durations": {91: 4.0}}
+        tracker = SimpleNamespace(
+            tracker=SimpleNamespace(max_time_lost=2)
         )
+        no_tracks = SimpleNamespace(tracker_id=np.asarray([], dtype=int))
 
-        self.assertEqual(person_history, {})
+        _maintain_track_history(
+            no_tracks,
+            person_history,
+            state_data,
+            tracker,
+        )
+        self.assertIn(91, person_history)
+        self.assertFalse(person_history[91].ready)
+        self.assertEqual(len(person_history[91]), 0)
+
+        same_track_resumed = SimpleNamespace(
+            tracker_id=np.asarray([91], dtype=int)
+        )
+        _maintain_track_history(
+            same_track_resumed,
+            person_history,
+            state_data,
+            tracker,
+        )
+        self.assertIn(91, person_history)
+        self.assertNotIn(91, state_data["missed_track_frames"])
+        self.assertFalse(person_history[91].ready)
+
+        for _ in range(3):
+            _maintain_track_history(
+                no_tracks,
+                person_history,
+                state_data,
+                tracker,
+            )
+        self.assertNotIn(91, person_history)
+        self.assertNotIn(91, state_data["person_durations"])
 
 
 class LSTMCheckpointTests(unittest.TestCase):

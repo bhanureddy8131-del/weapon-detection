@@ -42,3 +42,20 @@ models/
 *.db
 static/
 The_final-4
+# Generated datasets and training outputs
+SmartVision_Final/prepared_datasets/
+SmartVision_Final/runs/
+SmartVision_Final/datasets/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Local backup files
+*.backup
