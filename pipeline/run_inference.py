@@ -30,6 +30,8 @@ from src.config import (
     INPUT_VIDEO_DIR,
     RESULTS_DIR,
     WEBCAM_ID,
+    ALERTS_ENABLED,
+    ALERT_ENDPOINT_VERIFIED,
     CONFIDENCE_THRESHOLD,
     YOLO_IMAGE_SIZE,
     YOLO_IOU_THRESHOLD,
@@ -136,9 +138,19 @@ def load_models():
             lstm_model = None
             inv_class_map = {}
 
-    threat_manager = ThreatManager(
-        alerts_enabled=detector.alerts_enabled
+    production_alerts_enabled = (
+        detector.alerts_enabled
+        and ALERTS_ENABLED
+        and ALERT_ENDPOINT_VERIFIED
     )
+    if detector.alerts_enabled and not production_alerts_enabled:
+        logger.warning(
+            "Production alert delivery remains disabled. Set both "
+            "SMARTVISION_ALERTS_ENABLED and "
+            "SMARTVISION_ALERT_ENDPOINT_VERIFIED only after verifying the "
+            "configured FastAPI endpoint."
+        )
+    threat_manager = ThreatManager(alerts_enabled=detector.alerts_enabled)
 
     logger.info("YOLO initialized. Device: %s", device)
 
@@ -457,10 +469,12 @@ def update_person_history(
     source_name: str = "Stream",
     stage_timings: Optional[Dict[str, float]] = None,
     action_detections: Optional[List[Dict]] = None,
+    pose_frame: Optional[np.ndarray] = None,
 ):
     """Process tracked people, optional action recognition, and alerts."""
 
-    image_height, image_width = frame.shape[:2]
+    pose_source = frame if pose_frame is None else pose_frame
+    image_height, image_width = pose_source.shape[:2]
     threat_messages = []
 
     if len(tracked_objects) == 0:
@@ -507,7 +521,7 @@ def update_person_history(
         x2c = max(0, min(image_width, x2))
         y2c = max(0, min(image_height, y2))
 
-        person_crop = frame[y1c:y2c, x1c:x2c]
+        person_crop = pose_source[y1c:y2c, x1c:x2c]
 
         landmarks_list = None
 
@@ -761,6 +775,13 @@ def process_frame(
         "lstm": 0.0,
     }
     action_detections = []
+    pose_input_frame = (
+        frame.copy()
+        if lstm_model is not None
+        and pose_estimator is not None
+        and getattr(pose_estimator, "available", True)
+        else frame
+    )
     begin_alert_frame = getattr(threat_manager, "begin_frame", None)
     if begin_alert_frame is not None:
         begin_alert_frame()
@@ -874,6 +895,7 @@ def process_frame(
         source_name=source_name,
         stage_timings=stage_timings,
         action_detections=action_detections,
+        pose_frame=pose_input_frame,
     )
     pose_action_ms = (time.perf_counter() - stage_started) * 1000
 
@@ -1090,6 +1112,7 @@ def _run_single_source_offline(
 
     if not capture.isOpened():
         logger.error("Cannot open source: %s", source_name)
+        capture.release()
         return
 
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))

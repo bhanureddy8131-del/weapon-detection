@@ -10,14 +10,40 @@ from collections import deque
 import cv2
 import requests
 
-from src.config import LOG_COOLDOWN
+from src.config import (
+    ALERT_ENDPOINT_VERIFIED,
+    ALERT_RETRY_ATTEMPTS,
+    ALERT_RETRY_BACKOFF_SECONDS,
+    ALERTS_ENABLED,
+    LOG_COOLDOWN,
+)
 
 from src.utils.logger import setup_logger
 
 class ThreatManager:
     def __init__(self, alerts_enabled=False):
         self.logger = setup_logger()
-        self.alerts_enabled = alerts_enabled
+        self.alerts_requested = bool(alerts_enabled)
+        self.alerts_enabled = bool(
+            self.alerts_requested
+            and ALERTS_ENABLED
+            and ALERT_ENDPOINT_VERIFIED
+        )
+        if not self.alerts_enabled:
+            missing_gates = []
+            if not self.alerts_requested:
+                missing_gates.append("validated detector approval")
+            if not ALERT_ENDPOINT_VERIFIED:
+                missing_gates.append("verified FastAPI endpoint")
+            if not ALERTS_ENABLED:
+                missing_gates.append("SMARTVISION_ALERTS_ENABLED opt-in")
+            self.alert_disabled_reason = (
+                "Production delivery disabled until "
+                + ", ".join(missing_gates)
+                + "."
+            )
+        else:
+            self.alert_disabled_reason = None
         self.threat_logs = {}
         self._enqueue_failures = {}
         self.log_cooldown = LOG_COOLDOWN
@@ -112,36 +138,27 @@ class ThreatManager:
 
         if threat_level == "SAFE":
             return
-        if not self.alerts_enabled:
-            return
 
         detections = detections or []
         spatial_context = spatial_context or {}
+        action_name = str(action_label).lower()
+        event_type = (
+            "object_detection"
+            if action_name.endswith("detection") or action_name == "unattended"
+            else "action_recognition"
+        )
         event_key = (
             str(source_name),
             int(track_id),
-            str(threat_level),
-            str(action_label).lower(),
+            event_type,
+            action_name,
         )
         with self._dedup_lock:
             last_time = self.threat_logs.get(event_key, 0.0)
             if current_time - last_time < self.log_cooldown:
                 return
-            last_failure = self._enqueue_failures.get(event_key, 0.0)
-            if current_time - last_failure < 1.0:
-                return
 
             from src.config import SERVER_URL
-            if not SERVER_URL:
-                self.logger.error("Alert was not sent because SERVER_URL is empty.")
-                return
-
-            action_name = str(action_label).lower()
-            event_type = (
-                "object_detection"
-                if action_name.endswith("detection") or action_name == "unattended"
-                else "action_recognition"
-            )
             payload = {
                 "camera_id": source_name,
                 "threat_level": threat_level,
@@ -149,7 +166,6 @@ class ThreatManager:
                 "confidence": float(action_prob),
                 "data": {
                     "frame_id": frame_id,
-                    "event_type": event_type,
                     "detections": detections,
                     "action_classification": {
                         "class": action_label,
@@ -159,6 +175,29 @@ class ThreatManager:
                     "spatial_context": spatial_context,
                 },
             }
+
+            if not self.alerts_enabled:
+                incident = self._new_incident(payload)
+                reason = self.alert_disabled_reason
+                if not SERVER_URL:
+                    reason = "FastAPI incident endpoint is not configured."
+                self._update_incident(
+                    incident,
+                    status="not sent: production alerts disabled",
+                    error=reason,
+                )
+                with self._incident_lock:
+                    self._incident_history.appendleft(incident)
+                self.threat_logs[event_key] = current_time
+                self._prune_deduplication_cache(current_time)
+                return
+
+            last_failure = self._enqueue_failures.get(event_key, 0.0)
+            if current_time - last_failure < 1.0:
+                return
+            if not SERVER_URL:
+                self.logger.error("Alert was not sent because SERVER_URL is empty.")
+                return
 
             incident = self._send_alert_async(
                 SERVER_URL,
@@ -177,24 +216,7 @@ class ThreatManager:
 
     def _send_alert_async(self, url, payload, image_data=None, frame=None):
         enqueue_started = time.perf_counter()
-        incident = {
-            "id": uuid.uuid4().hex,
-            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "event_type": payload.get("data", {}).get(
-                "event_type",
-                "object_detection",
-            ),
-            "label": payload.get("label", "Unknown"),
-            "confidence": float(payload.get("confidence", 0.0)),
-            "track_id": payload.get("data", {})
-            .get("action_classification", {})
-            .get("track_id"),
-            "threat_level": payload.get("threat_level", "Unknown"),
-            "status": "queued",
-            "snapshot": None,
-            "api_elapsed_ms": None,
-            "error": None,
-        }
+        incident = self._new_incident(payload)
         item = {
             "incident": incident,
             "url": url,
@@ -227,6 +249,28 @@ class ThreatManager:
                 self.frame_enqueue_ms += elapsed_ms
         return incident if queued else None
 
+    @staticmethod
+    def _new_incident(payload):
+        return {
+            "id": uuid.uuid4().hex,
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "event_type": payload.get("data", {}).get(
+                "event_type",
+                "object_detection",
+            ),
+            "label": payload.get("label", "Unknown"),
+            "confidence": float(payload.get("confidence", 0.0)),
+            "track_id": payload.get("data", {})
+            .get("action_classification", {})
+            .get("track_id"),
+            "threat_level": payload.get("threat_level", "Unknown"),
+            "status": "queued",
+            "attempts": 0,
+            "snapshot": None,
+            "api_elapsed_ms": None,
+            "error": None,
+        }
+
     def _deliver_alerts(self):
         with requests.Session() as session:
             while True:
@@ -255,40 +299,80 @@ class ThreatManager:
                     files = (
                         {"file": ("alert.jpg", image_data, "image/jpeg")}
                         if image_data
-                        else None
+                        else {"_multipart": ("", b"", "text/plain")}
                     )
                     started_at = time.perf_counter()
-                    try:
-                        response = session.post(
-                            item["url"],
-                            data={
-                                "incident_data": json.dumps(item["payload"])
-                            },
-                            files=files,
-                            timeout=(1.0, 3.0),
+                    response = None
+                    last_error = None
+                    attempts = max(1, int(ALERT_RETRY_ATTEMPTS))
+                    for attempt in range(1, attempts + 1):
+                        self._update_incident(
+                            incident,
+                            status=(
+                                "sending"
+                                if attempt == 1
+                                else f"retrying ({attempt}/{attempts})"
+                            ),
+                            attempts=attempt,
                         )
-                        response.raise_for_status()
-                    except requests.RequestException as exc:
-                        elapsed_ms = (time.perf_counter() - started_at) * 1000
+                        try:
+                            response = session.post(
+                                item["url"],
+                                data={
+                                    "incident_data": json.dumps(item["payload"])
+                                },
+                                files=files,
+                                timeout=(0.5, 2.0),
+                            )
+                            response.raise_for_status()
+                            last_error = None
+                            break
+                        except requests.RequestException as exc:
+                            last_error = exc
+                            status_code = getattr(
+                                getattr(exc, "response", None),
+                                "status_code",
+                                None,
+                            )
+                            retryable = (
+                                status_code is None
+                                or status_code == 429
+                                or status_code >= 500
+                            )
+                            if not retryable or attempt == attempts:
+                                break
+                            self._update_incident(
+                                incident,
+                                status=f"retrying ({attempt}/{attempts})",
+                                error=str(exc),
+                            )
+                            delay = ALERT_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                            if delay > 0:
+                                time.sleep(delay)
+
+                    elapsed_ms = (time.perf_counter() - started_at) * 1000
+                    if last_error is not None or response is None:
+                        error_text = str(last_error or "No response from incident endpoint.")
                         self._update_incident(
                             incident,
                             status="failed",
-                            error=str(exc),
+                            error=error_text,
                             api_elapsed_ms=elapsed_ms,
                         )
                         with self._incident_lock:
                             self.api_healthy = False
                             self.api_last_latency_ms = elapsed_ms
-                            self.api_last_error = str(exc)
+                            self.api_last_error = error_text
                         self.logger.error(
-                            "Alert %s delivery failed after %.1f ms: %s",
+                            "Alert %s delivery failed after %s attempt(s) "
+                            "and %.1f ms: %s",
                             incident["id"],
+                            incident["attempts"],
                             elapsed_ms,
-                            exc,
+                            error_text,
                         )
                         continue
 
-                    elapsed_ms = (time.perf_counter() - started_at) * 1000
                     self._update_incident(
                         incident,
                         status=f"delivered (HTTP {response.status_code})",
@@ -369,6 +453,8 @@ class ThreatManager:
                 "prepare_ms": self.api_prepare_ms,
                 "last_error": self.api_last_error,
                 "queued": self._alert_queue.qsize(),
+                "enabled": self.alerts_enabled,
+                "disabled_reason": self.alert_disabled_reason,
             }
 
     def close(self, timeout=1.0):

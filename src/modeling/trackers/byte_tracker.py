@@ -83,12 +83,6 @@ class ByteTracker:
             if not duplicate:
                 accepted.append(candidate)
         return accepted
-        self.tracker = sv.ByteTrack(
-            track_activation_threshold=0.25,
-            lost_track_buffer=self.lost_track_buffer,
-            minimum_matching_threshold=0.8,
-            frame_rate=30,
-        )
 
     def set_frame_rate(self, frame_rate):
         """Scale ByteTrack's lost-track window to the inference cadence."""
@@ -136,31 +130,34 @@ class ByteTracker:
             ]
 
         tracker_ids = np.asarray(tracker_ids)
-        valid_indices = [
-            index
-            for index, track_id in enumerate(tracker_ids)
-            if np.isfinite(track_id) and float(track_id) >= 0
-        ]
+        valid_indices = []
+        for index, track_id in enumerate(tracker_ids):
+            try:
+                numeric_id = float(track_id)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(numeric_id) and numeric_id >= 0 and numeric_id.is_integer():
+                valid_indices.append(index)
+
+        def detection_confidence(index):
+            if confidences is None or index >= len(confidences):
+                return 0.0
+            try:
+                value = float(confidences[index])
+            except (TypeError, ValueError):
+                return 0.0
+            return value if math.isfinite(value) else 0.0
+
         best_index_by_id = {}
         confidences = getattr(tracked_detections, "confidence", None)
         for index in valid_indices:
             track_id = int(tracker_ids[index])
-            confidence = (
-                float(confidences[index])
-                if confidences is not None
-                and np.isfinite(confidences[index])
-                else 0.0
-            )
+            confidence = detection_confidence(index)
             previous = best_index_by_id.get(track_id)
             if previous is None:
                 best_index_by_id[track_id] = index
                 continue
-            previous_confidence = (
-                float(confidences[previous])
-                if confidences is not None
-                and np.isfinite(confidences[previous])
-                else 0.0
-            )
+            previous_confidence = detection_confidence(previous)
             if confidence > previous_confidence:
                 best_index_by_id[track_id] = index
 

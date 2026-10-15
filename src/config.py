@@ -19,6 +19,27 @@ API_BASE_URL = os.getenv(
     "http://127.0.0.1:8000/api/v1",
 ).rstrip("/")
 SERVER_URL = f"{API_BASE_URL}/incidents"
+ALERTS_ENABLED = os.getenv("SMARTVISION_ALERTS_ENABLED", "false").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+ALERT_ENDPOINT_VERIFIED = os.getenv(
+    "SMARTVISION_ALERT_ENDPOINT_VERIFIED",
+    "false",
+).strip().lower() in {"1", "true", "yes", "on"}
+ALERT_RETRY_ATTEMPTS = min(
+    5,
+    max(
+        1,
+    int(os.getenv("SMARTVISION_ALERT_RETRY_ATTEMPTS", "3")),
+    ),
+)
+ALERT_RETRY_BACKOFF_SECONDS = min(
+    2.0,
+    max(
+        0.0,
+    float(os.getenv("SMARTVISION_ALERT_RETRY_BACKOFF_SECONDS", "0.5")),
+    ),
+)
 
 # --- PARAMETERS ---
 WEBCAM_ID = 0

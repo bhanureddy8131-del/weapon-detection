@@ -68,6 +68,7 @@ class InferenceWorker:
         }
         self.tracker = ByteTracker()
         self.pose_estimator = None
+        self.pose_error = None
         self._snapshot = {
             "last_processed_frame": None,
             "last_processed_sequence": 0,
@@ -189,7 +190,16 @@ class InferenceWorker:
                         ) + f"MediaPipe shutdown failed: {exc}"
 
     def _run_loop(self):
-        self.pose_estimator = MediaPipeEstimator()
+        try:
+            self.pose_estimator = MediaPipeEstimator()
+        except Exception as exc:
+            self.pose_estimator = None
+            self.pose_error = str(exc)
+            logger.exception(
+                "MediaPipe initialization failed for %s; continuing "
+                "without pose/action inference.",
+                self.source_name,
+            )
         while not self._stop_event.is_set():
             result = self.capture.read(self._last_sequence)
             if result is None:
@@ -210,6 +220,8 @@ class InferenceWorker:
                     self._person_history.clear()
                     self._state_data["unattended_bag_timer"] = 0.0
                     self._state_data["person_durations"] = {}
+                    self._state_data["missed_track_frames"] = {}
+                    self.tracker.reset()
                 dt = min(dt, 1.0)
             self._last_captured_at = captured_at
 

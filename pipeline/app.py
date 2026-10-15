@@ -205,7 +205,9 @@ def render_live_inference():
     result = worker.snapshot()
     state_data = result["state_data"]
     api_health = get_api_health_monitor().snapshot()
-    health_columns = st.columns(5)
+    threat_manager = runtime["threat_manager"]
+    delivery_health = threat_manager.get_delivery_health()
+    health_columns = st.columns(6)
     custom_detector = getattr(runtime["detector"], "is_custom_model", False)
     detector_validated = getattr(runtime["detector"], "is_validated", False)
     health_columns[0].badge(
@@ -224,6 +226,11 @@ def render_live_inference():
     pose_estimator = worker.pose_estimator
     pose_available = (
         pose_estimator is not None and pose_estimator.available
+    )
+    pose_error = worker.pose_error or (
+        pose_estimator.diagnostic
+        if pose_estimator is not None and not pose_available
+        else None
     )
     health_columns[2].badge(
         "MediaPipe: ready" if pose_available else (
@@ -249,10 +256,41 @@ def render_live_inference():
             "red" if api_health["healthy"] is False else "gray"
         ),
     )
+    if not delivery_health["enabled"]:
+        delivery_label, delivery_color = "Alerts: disabled", "orange"
+    elif delivery_health["healthy"] is True:
+        delivery_label, delivery_color = "Delivery: confirmed", "green"
+    elif delivery_health["healthy"] is False:
+        delivery_label, delivery_color = "Delivery: failed", "red"
+    elif delivery_health["queued"]:
+        delivery_label, delivery_color = "Delivery: queued", "orange"
+    else:
+        delivery_label, delivery_color = "Delivery: untested", "gray"
+    health_columns[5].badge(delivery_label, color=delivery_color)
+    if not delivery_health["enabled"]:
+        st.warning(
+            "Threat notifications are disabled. "
+            + str(delivery_health["disabled_reason"])
+        )
+    elif delivery_health["healthy"] is False:
+        st.error(
+            "The latest alert POST failed; no delivery is being reported as "
+            "successful. "
+            + str(delivery_health["last_error"])
+        )
     if pose_estimator is None:
-        st.info("MediaPipe is initializing in the inference worker.")
+        if pose_error:
+            st.warning(
+                "MediaPipe is unavailable; detection and tracking continue. "
+                + pose_error
+            )
+        else:
+            st.info("MediaPipe is initializing in the inference worker.")
     elif not pose_available:
-        st.warning(pose_estimator.diagnostic)
+        st.warning(
+            "MediaPipe is unavailable; detection and tracking continue. "
+            + pose_estimator.diagnostic
+        )
 
     live_frame = None
     live_age_ms = None
@@ -350,7 +388,7 @@ def render_live_inference():
                         f"{summary['mean']:.1f} ms",
                         delta=f"p95 {summary['p95']:.1f} ms",
                     )
-            delivery_health = runtime["threat_manager"].get_delivery_health()
+            delivery_health = threat_manager.get_delivery_health()
             api_value = delivery_health["last_latency_ms"]
             api_columns = st.columns(3)
             api_columns[0].metric(
@@ -410,7 +448,7 @@ def render_live_inference():
     else:
         st.caption("No non-normal action was classified in the latest sequence.")
 
-    delivery = runtime["threat_manager"].get_delivery_health()
+    delivery = threat_manager.get_delivery_health()
     if delivery["last_latency_ms"] is not None:
         st.caption(
             "Latest API delivery: "
@@ -450,14 +488,20 @@ def render_inference_snapshot():
 @st.fragment(run_every="2s")
 def render_incident_history(runtime):
     with st.expander("Incident history and alert delivery"):
-        incidents = runtime["threat_manager"].get_incident_history(limit=5)
+        threat_manager = runtime["threat_manager"]
+        delivery = threat_manager.get_delivery_health()
+        incidents = threat_manager.get_incident_history(limit=10)
         if not incidents:
-            st.caption("No incidents have been raised in this session.")
+            st.caption("No alert events have been raised in this session.")
+        st.caption(
+            "Session-local detections are distinct from incidents persisted by "
+            "FastAPI. A queued event is not considered delivered."
+        )
         for incident in incidents:
             st.write(
                 f"{incident['created_at']} · {incident['event_type']} · "
                 f"{incident['label']} · {incident['confidence']:.1%} · "
-                f"{incident['status']}"
+                f"{incident['status']} · attempts {incident['attempts']}"
             )
             if incident["snapshot"]:
                 st.image(
@@ -468,6 +512,11 @@ def render_incident_history(runtime):
                 )
             if incident["error"]:
                 st.caption(incident["error"])
+        if not delivery["enabled"]:
+            st.warning(
+                "Backend notifications are disabled: "
+                + str(delivery["disabled_reason"])
+            )
 
 
 # --------------------------------------------------
@@ -660,11 +709,12 @@ def run_streamlit_inference_page():
                     if capture.wait_until_ready():
                         st.session_state["smartvision_capture"] = capture
                         st.session_state["smartvision_source"] = source_path
-                        source_name = (
-                            f"camera_{capture.source}"
-                            if capture.is_webcam
-                            else os.path.basename(os.fspath(capture.source))
-                        )
+                        if capture.is_webcam:
+                            source_name = f"camera_{capture.source}"
+                        elif isinstance(capture.source, (str, os.PathLike)):
+                            source_name = os.path.basename(capture.source)
+                        else:
+                            source_name = f"source_{capture.source}"
                         try:
                             worker = InferenceWorker(
                                 capture,
@@ -791,7 +841,11 @@ def _render_status_header(runtime):
     api_health = get_api_health_monitor().snapshot()
     api_ok = api_health["healthy"] is True
     camera_ok = capture is not None and capture.is_running
-    camera_open = camera_ok and capture.opened
+    camera_open = (
+        capture is not None
+        and camera_ok
+        and capture.opened
+    )
     header_columns = st.columns([2.2, 1, 1, 1, 1.1, 0.8])
     header_columns[0].markdown("## SmartVision Pro")
     header_columns[1].badge(
@@ -1062,12 +1116,14 @@ def _render_system_health(runtime):
         )
     delivery = runtime["threat_manager"].get_delivery_health()
     st.write("Alert queue:", delivery["queued"], "pending")
-    st.write(
-        "Last alert delivery:",
-        delivery["last_error"] or (
-            "Delivered" if delivery["healthy"] else "No delivery attempted"
-        ),
-    )
+    if not delivery["enabled"]:
+        st.warning("Alert delivery disabled: " + str(delivery["disabled_reason"]))
+    elif delivery["healthy"] is True:
+        st.write("Last alert delivery:", "Confirmed by FastAPI")
+    elif delivery["healthy"] is False:
+        st.error("Last alert delivery failed: " + str(delivery["last_error"]))
+    else:
+        st.write("Last alert delivery:", "No delivery attempted")
     names = detector.class_names or {}
     st.write("Detector classes:", ", ".join(map(str, names.values() if isinstance(names, dict) else names)))
 

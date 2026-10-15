@@ -116,6 +116,10 @@ smart-vision/
 - `DRAW_PERSON_BOXES`: Enable bounding box overlays for detected persons.
 - `DRAW_LABELS`: Enable text labels for detections.
 - `API_BASE_URL`: Incident API base (`SMARTVISION_API_BASE_URL`, default `http://127.0.0.1:8000/api/v1`).
+- `SERVER_URL`: Configured POST endpoint (`${API_BASE_URL}/incidents`). FastAPI entry point is `server.main:app`; the project starts it with `python -m uvicorn server.main:app --host 127.0.0.1 --port 8000`.
+- `SMARTVISION_ALERTS_ENABLED`: Explicit production-delivery opt-in; defaults to `false`.
+- `SMARTVISION_ALERT_ENDPOINT_VERIFIED`: Separate operator gate; defaults to `false` and must only be enabled after checking the configured endpoint and its OpenAPI multipart contract.
+- `SMARTVISION_ALERT_RETRY_ATTEMPTS` and `SMARTVISION_ALERT_RETRY_BACKOFF_SECONDS`: Bounded retry controls (defaults: 3 attempts, 0.5 seconds exponential base; capped at 5 attempts and 2 seconds base).
 - `YOLO_IMAGE_SIZE`: Inference size (`SMARTVISION_YOLO_IMAGE_SIZE`, default `416`; the dashboard allows changing it).
 - `YOLO_IOU_THRESHOLD`: YOLO NMS IoU threshold (`SMARTVISION_YOLO_IOU`, default `0.70`).
 - `SMARTVISION_CONFIDENCE_THRESHOLD`, `SMARTVISION_PERSON_CONFIDENCE`, `SMARTVISION_GUN_CONFIDENCE`, and `SMARTVISION_KNIFE_CONFIDENCE`: Detection thresholds. The UI can raise, but not lower, the configured global threshold.
@@ -126,7 +130,11 @@ The custom detector path is `models/yolo11s_fine_tune_v3.pt`. The application ch
 
 When the custom file is absent, the app explicitly falls back to the generic 80-class `yolo11s.pt` COCO model; that model has no `gun` or `atm` class. It can show its `person`, `backpack`, `handbag`, and generic `knife` predictions, but the generic knife is not treated as a project weapon.
 
-Production alerts stay disabled until an operator has reviewed the validation metrics and saved representative images. After that review, set `production_alerts_approved` to `true` in `models/yolo11s_fine_tune_v3.pt.validation.json`; do not enable alerts for a model whose validation results or sample predictions are unacceptable. A generic model or unvalidated six-class checkpoint cannot send threat alerts.
+Production alerts require all three gates: a validated custom detector with operator approval, `SMARTVISION_ALERT_ENDPOINT_VERIFIED=true`, and `SMARTVISION_ALERTS_ENABLED=true`. The configured endpoint is `POST /api/v1/incidents` and expects multipart form field `incident_data` containing the `IncidentCreate` JSON; an optional multipart `file` carries a JPEG snapshot. When no snapshot is attached, the client still sends multipart without a `file`, and the backend creates the incident with `image_path=null`. Attached snapshots are stored by the existing backend under `server/static/alerts` and referenced by the incident row.
+
+Alert sending runs on a bounded background queue, uses short connect/read timeouts, retries transient failures only, and records queued, retrying, delivered, failed, or disabled outcomes in the session dashboard. A repeated event for the same camera, tracked ID, event type, and class is deduplicated for the configured cooldown. A delivery is marked successful only after a 2xx response. A successful GET health check alone does not authorize production notifications.
+
+Before enabling alerts, verify the configured endpoint read-only with `GET /`, `GET /openapi.json`, and `GET /api/v1/incidents`; confirm the POST schema is multipart. Do not send a synthetic incident to the production database for verification. After reviewing model validation and confirming the real endpoint, set the two environment gates in the service environment. A generic model or unvalidated six-class checkpoint cannot send threat alerts.
 
 The six-class dataset configuration is `The_final-4/data.yaml` (14,018 train, 4,005 validation, and 2,002 test images). Training is CPU-only here and can take many hours. The training script creates a timestamped output directory so existing runs are not overwritten:
 

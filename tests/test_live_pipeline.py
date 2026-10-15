@@ -353,6 +353,7 @@ class LivePipelineTests(unittest.TestCase):
         session = _Session([
             _Response(),
             requests.ConnectionError("test backend unavailable"),
+            _Response(),
         ])
         session_patcher = patch(
             "src.core.threat_manager.requests.Session",
@@ -361,8 +362,19 @@ class LivePipelineTests(unittest.TestCase):
         session_patcher.start()
         self.addCleanup(session_patcher.stop)
 
+        alerts_gate = patch("src.core.threat_manager.ALERTS_ENABLED", True)
+        endpoint_gate = patch(
+            "src.core.threat_manager.ALERT_ENDPOINT_VERIFIED",
+            True,
+        )
+        alerts_gate.start()
+        endpoint_gate.start()
+        self.addCleanup(alerts_gate.stop)
+        self.addCleanup(endpoint_gate.stop)
+
         manager = ThreatManager(alerts_enabled=True)
         self.addCleanup(manager.close)
+        self.assertTrue(manager.alerts_enabled)
         manager.log_threat(
             7,
             "camera_test",
@@ -390,21 +402,105 @@ class LivePipelineTests(unittest.TestCase):
             time.sleep(0.01)
 
         self.assertEqual(manager._alert_queue.unfinished_tasks, 0)
-        self.assertEqual(len(session.requests), 2)
+        self.assertEqual(len(session.requests), 3)
         first_request = session.requests[0][1]
-        self.assertEqual(first_request["timeout"], (1.0, 3.0))
+        self.assertEqual(first_request["timeout"], (0.5, 2.0))
+        self.assertIn("_multipart", first_request["files"])
+        self.assertNotIn("file", first_request["files"])
         posted_payload = json.loads(first_request["data"]["incident_data"])
         self.assertEqual(
-            posted_payload["data"]["event_type"],
-            "object_detection",
+            set(posted_payload["data"]),
+            {
+                "frame_id",
+                "detections",
+                "action_classification",
+                "spatial_context",
+            },
+        )
+        from server.schemas import IncidentCreate
+
+        self.assertEqual(
+            IncidentCreate(**posted_payload).camera_id,
+            "camera_test",
         )
         incidents = manager.get_incident_history()
-        self.assertEqual(incidents[0]["status"], "failed")
+        self.assertEqual(incidents[0]["status"], "delivered (HTTP 201)")
+        self.assertEqual(incidents[0]["attempts"], 2)
         self.assertEqual(
             incidents[1]["status"],
             "delivered (HTTP 201)",
         )
+        self.assertTrue(manager.get_delivery_health()["healthy"])
+
+    def test_failed_delivery_records_all_retries_and_never_reports_success(self):
+        session = _Session([
+            requests.ConnectionError("backend offline"),
+            requests.ConnectionError("backend offline"),
+            requests.ConnectionError("backend offline"),
+        ])
+        gates = [
+            patch("src.core.threat_manager.ALERTS_ENABLED", True),
+            patch("src.core.threat_manager.ALERT_ENDPOINT_VERIFIED", True),
+            patch("src.core.threat_manager.ALERT_RETRY_BACKOFF_SECONDS", 0.0),
+            patch("src.core.threat_manager.requests.Session", return_value=session),
+        ]
+        for gate in gates:
+            gate.start()
+            self.addCleanup(gate.stop)
+
+        manager = ThreatManager(alerts_enabled=True)
+        self.addCleanup(manager.close)
+        manager.log_threat(
+            17,
+            "camera_test",
+            "knife detection",
+            0.91,
+            "HIGH: WEAPON DETECTED",
+        )
+        deadline = time.monotonic() + 5
+        while manager._alert_queue.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        incident = manager.get_incident_history(limit=1)[0]
+        self.assertEqual(len(session.requests), 3)
+        self.assertEqual(incident["attempts"], 3)
+        self.assertEqual(incident["status"], "failed")
+        self.assertIn("backend offline", incident["error"])
         self.assertFalse(manager.get_delivery_health()["healthy"])
+
+    def test_production_gate_disabled_records_local_event_without_sending(self):
+        with (
+            patch("src.core.threat_manager.ALERTS_ENABLED", True),
+            patch("src.core.threat_manager.ALERT_ENDPOINT_VERIFIED", False),
+            patch("src.core.threat_manager.requests.Session") as session,
+        ):
+            manager = ThreatManager(alerts_enabled=True)
+            self.addCleanup(manager.close)
+            self.assertFalse(manager.alerts_enabled)
+            self.assertIsNone(manager._alert_thread)
+            manager.log_threat(
+                17,
+                "camera_test",
+                "knife detection",
+                0.91,
+                "HIGH: WEAPON DETECTED",
+            )
+            manager.log_threat(
+                17,
+                "camera_test",
+                "knife detection",
+                0.91,
+                "HIGH: WEAPON DETECTED",
+            )
+
+        session.assert_not_called()
+        local_events = manager.get_incident_history()
+        self.assertEqual(len(local_events), 1)
+        self.assertEqual(
+            local_events[0]["status"],
+            "not sent: production alerts disabled",
+        )
+        self.assertIn("verified FastAPI endpoint", local_events[0]["error"])
 
     def test_full_alert_queue_is_reported_and_can_be_retried(self):
         manager = ThreatManager(alerts_enabled=False)
@@ -456,7 +552,7 @@ class LivePipelineTests(unittest.TestCase):
             )
 
         self.assertIn(
-            ("camera_test", 7, "HIGH: WEAPON DETECTED", "knife detection"),
+            ("camera_test", 7, "object_detection", "knife detection"),
             manager.threat_logs,
         )
         self.assertEqual(manager.get_delivery_health()["queued"], 1)
