@@ -1,5 +1,5 @@
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$PythonExe = Join-Path $ScriptDir "env\Scripts\python.exe"
+$PythonExe = Join-Path $ScriptDir ".venv\Scripts\python.exe"
 
 if (-not (Test-Path $PythonExe)) {
     Write-Host "Error: Virtual environment not found at $PythonExe" -ForegroundColor Red
@@ -7,11 +7,15 @@ if (-not (Test-Path $PythonExe)) {
 }
 
 Write-Host "Starting Backend Server on http://localhost:8000 ..." -ForegroundColor Green
-Start-Process -FilePath $PythonExe -ArgumentList "-m uvicorn server.main:app --host 0.0.0.0 --port 8000"
-
-Start-Sleep -Seconds 3
+Start-Process `
+    -FilePath $PythonExe `
+    -ArgumentList @("-m", "uvicorn", "server.main:app", "--host", "127.0.0.1", "--port", "8000") `
+    -WorkingDirectory $ScriptDir
 
 Write-Host "Starting SmartVision Dashboard on http://localhost:8501 ..." -ForegroundColor Green
-Start-Process -FilePath $PythonExe -ArgumentList "-m streamlit run pipeline/app.py --server.port 8501"
+Start-Process `
+    -FilePath $PythonExe `
+    -ArgumentList @("-m", "streamlit", "run", "pipeline/app.py", "--server.port", "8501") `
+    -WorkingDirectory $ScriptDir
 
 Write-Host "SmartVision Pro services started." -ForegroundColor Green

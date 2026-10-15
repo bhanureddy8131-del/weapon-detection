@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Configuration
-VENV_PATH="env/bin/activate"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_PATH="$SCRIPT_DIR/.venv/bin/activate"
 SERVER_PORT=8000
 UI_PORT=8501
 
@@ -19,6 +19,7 @@ fi
 
 echo -e "${GREEN}Activating Environment...${NC}"
 source $VENV_PATH
+cd "$SCRIPT_DIR"
 
 # Function to cleanup background processes on exit
 cleanup() {

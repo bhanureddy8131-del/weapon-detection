@@ -1,0 +1,58 @@
+from pathlib import Path
+
+from ultralytics import YOLO
+
+from src.config import ROOT_DIR
+from src.utils.base_detector import BaseDetector
+
+
+class YOLODetector(BaseDetector):
+    def __init__(self):
+        self.model = None
+        self.class_names = None
+        print("YOLODetector initialized.")
+
+    def load_model(self, model_path):
+        root_dir = Path(ROOT_DIR)
+        requested_path = Path(model_path)
+
+        if not requested_path.is_absolute():
+            requested_path = root_dir / requested_path
+
+        fallback_path = root_dir / "yolo11s.pt"
+
+        if (
+            not requested_path.is_file()
+            or requested_path.stat().st_size < 10000
+        ):
+            print(f"Custom model unavailable: {requested_path}")
+
+            if not fallback_path.is_file():
+                raise FileNotFoundError(
+                    "No usable YOLO model was found.\n"
+                    f"Custom model: {requested_path}\n"
+                    f"Fallback model: {fallback_path}"
+                )
+
+            print(f"Using standard YOLO model: {fallback_path}")
+            requested_path = fallback_path
+
+        print(f"Loading YOLO model from: {requested_path}")
+
+        self.model = YOLO(str(requested_path))
+        self.class_names = self.model.names
+
+        print("YOLO model loaded successfully.")
+        print(f"Classes found: {self.class_names}")
+
+    def predict(self, frame, conf=0.5):
+        if self.model is None:
+            raise RuntimeError(
+                "Model has not been loaded. Call load_model() first."
+            )
+
+        return self.model.predict(
+            source=frame,
+            conf=conf,
+            verbose=False,
+        )

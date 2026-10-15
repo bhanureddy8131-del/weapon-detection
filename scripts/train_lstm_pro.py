@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
@@ -6,11 +6,18 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 import random
-import copy
+from src.config import LSTM_MODEL_PATH, ROOT_DIR, SEQUENCE_LENGTH
+from src.modeling.classifiers.lstm import (
+    ACTION_ARCHITECTURE,
+    ACTION_CLASSES,
+    POSE_FEATURE_LAYOUT,
+    POSE_FEATURE_SIZE,
+    BidirectionalLSTM,
+)
 
 # --- CONFIGURATION ---
-DATA_PATH = os.path.expanduser("../data/processed/lstm_data")
-MODEL_SAVE_PATH = "../models/lstm_action_recognition_pro.pth" # New filename
+DATA_PATH = Path(ROOT_DIR) / "data" / "processed" / "lstm_data"
+MODEL_SAVE_PATH = Path(LSTM_MODEL_PATH)
 EPOCHS = 80              # More epochs for the scheduler to work
 BATCH_SIZE = 64          # Bigger batch for stable gradients
 LEARNING_RATE = 0.001
@@ -43,51 +50,43 @@ class ActionDataset(Dataset):
             
         return x, y
 
-# --- 2. BIDIRECTIONAL LSTM MODEL ---
-class BidirectionalLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes):
-        super(BidirectionalLSTM, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
-        # bidirectional=True doubles the output features
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, 
-                            batch_first=True, dropout=DROPOUT_RATE, bidirectional=True)
-        
-        # Input to FC is hidden_size * 2 because of bidirectionality
-        self.fc = nn.Linear(hidden_size * 2, num_classes)
-
-    def forward(self, x):
-        # Initialize hidden states (num_layers * 2 for bidirectional)
-        h0 = torch.zeros(self.num_layers * 2, x.size(0), self.hidden_size).to(x.device)
-        c0 = torch.zeros(self.num_layers * 2, x.size(0), self.hidden_size).to(x.device)
-        
-        out, _ = self.lstm(x, (h0, c0))
-        
-        # Concatenate the final forward and backward states
-        # out shape: [batch, seq, hidden*2]
-        # We take the last time step
-        out = self.fc(out[:, -1, :]) 
-        return out
-
 # --- 3. TRAINING FUNCTION ---
 def train_model():
     print(" Starting Professional Training Pipeline...")
+
+    if not DATA_PATH.is_dir():
+        raise FileNotFoundError(
+            f"Action training data is missing: {DATA_PATH}. "
+            "Run scripts/create_lstm_data.py with labeled action clips first."
+        )
     
     features = []
     labels = []
     
-    class_names = sorted([d for d in os.listdir(DATA_PATH) if os.path.isdir(os.path.join(DATA_PATH, d))])
+    class_directories = {
+        path.name.strip().lower(): path
+        for path in DATA_PATH.iterdir()
+        if path.is_dir()
+    }
+    if set(class_directories) != ACTION_CLASSES:
+        raise ValueError(
+            "Action training folders must be exactly "
+            f"{sorted(ACTION_CLASSES)}; found {sorted(class_directories)}."
+        )
+    class_names = sorted(ACTION_CLASSES)
     class_map = {name: i for i, name in enumerate(class_names)}
     print(f"   Classes Map: {class_map}")
 
     # --- ADVANCED BALANCING STRATEGY ---
     for class_name in class_names:
-        class_dir = os.path.join(DATA_PATH, class_name)
-        files = [f for f in os.listdir(class_dir) if f.endswith('.npy')]
+        class_dir = class_directories[class_name]
+        files = sorted(class_dir.glob("*.npy"))
         
         print(f"   Processing '{class_name}': Found {len(files)} files.")
         
+        if not files:
+            raise ValueError(f"Action class '{class_name}' contains no .npy sequences.")
+
         selected_files = []
         if len(files) >= TARGET_SAMPLES:
             selected_files = random.sample(files, TARGET_SAMPLES)
@@ -100,7 +99,15 @@ def train_model():
 
         # Load Data
         for file in selected_files:
-            data = np.load(os.path.join(class_dir, file))
+            data = np.load(file)
+            expected_shape = (SEQUENCE_LENGTH, POSE_FEATURE_SIZE)
+            if data.shape != expected_shape:
+                raise ValueError(
+                    f"Training sequence {file} has shape {data.shape}; "
+                    f"expected {expected_shape}."
+                )
+            if not np.isfinite(data).all():
+                raise ValueError(f"Training sequence {file} contains non-finite values.")
             features.append(data)
             labels.append(class_map[class_name])
 
@@ -125,8 +132,19 @@ def train_model():
         device = torch.device('mps')
 
     # Model Init
-    input_size = X.shape[2]
-    model = BidirectionalLSTM(input_size, HIDDEN_SIZE, NUM_LAYERS, len(class_names)).to(device)
+    if X.ndim != 3 or X.shape[1:] != (SEQUENCE_LENGTH, POSE_FEATURE_SIZE):
+        raise ValueError(
+            "Loaded training data does not match the configured sequence contract: "
+            f"received {X.shape}."
+        )
+    input_size = POSE_FEATURE_SIZE
+    model = BidirectionalLSTM(
+        input_size,
+        HIDDEN_SIZE,
+        NUM_LAYERS,
+        len(class_names),
+        dropout_rate=DROPOUT_RATE,
+    ).to(device)
     
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5) 
@@ -173,14 +191,19 @@ def train_model():
 
         if acc > best_acc:
             best_acc = acc
+            MODEL_SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'class_map': class_map,
                 'input_size': input_size,
                 'hidden_size': HIDDEN_SIZE,
                 'num_layers': NUM_LAYERS,
-                'bidirectional': True 
-            }, MODEL_SAVE_PATH)
+                'bidirectional': True,
+                'architecture': ACTION_ARCHITECTURE,
+                'sequence_length': SEQUENCE_LENGTH,
+                'feature_layout': POSE_FEATURE_LAYOUT,
+                'dropout_rate': DROPOUT_RATE,
+            }, str(MODEL_SAVE_PATH))
 
     print(f"\n Best Accuracy: {best_acc:.2f}%")
     print(f" Saved to {MODEL_SAVE_PATH}")

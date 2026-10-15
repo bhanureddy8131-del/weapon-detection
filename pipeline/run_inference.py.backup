@@ -1,0 +1,905 @@
+﻿# pipeline/run_inference.py
+
+import os
+import sys
+import time
+from collections import deque
+from pathlib import Path
+from typing import Deque, Dict, List, Tuple
+
+import cv2
+import numpy as np
+import torch
+
+# ---------------------------------------------------------------------
+# PROJECT PATH
+# ---------------------------------------------------------------------
+
+ROOT_DIR = str(Path(__file__).resolve().parent.parent)
+
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+# ---------------------------------------------------------------------
+# PROJECT IMPORTS
+# ---------------------------------------------------------------------
+
+from src.config import (
+    YOLO_MODEL_PATH,
+    LSTM_MODEL_PATH,
+    INPUT_VIDEO_DIR,
+    RESULTS_DIR,
+    WEBCAM_ID,
+    CONFIDENCE_THRESHOLD,
+    ACTION_CONFIDENCE_THRESHOLD,
+    SEQUENCE_LENGTH,
+    PERSON_CLASS_ID,
+    WEAPON_CLASS_IDS,
+    GUN_CLASS_IDS,
+    KNIFE_CLASS_ID,
+    ATM_CLASS_ID,
+    BACKPACK_CLASS_ID,
+    HANDBAG_CLASS_ID,
+    CONTEXT_CLASS_IDS,
+    UNATTENDED_BAG_THRESHOLD,
+    get_color,
+    DRAW_PERSON_BOXES,
+    DRAW_LABELS,
+)
+
+from src.modeling.detectors.yolo_detector import YOLODetector
+from src.modeling.trackers.byte_tracker import ByteTracker
+from src.modeling.pose_estimators.mediapipe import MediaPipeEstimator
+from src.modeling.classifiers.lstm import BidirectionalLSTM
+from src.core.threat_manager import ThreatManager
+from src.utils.logger import setup_logger
+
+logger = setup_logger()
+
+
+# ---------------------------------------------------------------------
+# MODEL LOADING
+# ---------------------------------------------------------------------
+
+def load_models():
+    """
+    Load the YOLO detector and optional LSTM classifier.
+
+    Returns:
+        detector, lstm_model, device, inv_class_map, threat_manager
+
+    The YOLODetector class handles fallback to the root yolo11s.pt file.
+    """
+
+    detector = YOLODetector()
+
+    try:
+        detector.load_model(YOLO_MODEL_PATH)
+    except Exception:
+        logger.exception("Unable to load a YOLO model.")
+        return None, None, None, None, None
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif (
+        hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    ):
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+
+    # LSTM is optional.
+    lstm_model = None
+    inv_class_map = {
+        0: "normal",
+        1: "fighting",
+        2: "shooting",
+    }
+
+    lstm_path = Path(LSTM_MODEL_PATH)
+
+    if not lstm_path.is_absolute():
+        lstm_path = Path(ROOT_DIR) / lstm_path
+
+    if not lstm_path.is_file() or lstm_path.stat().st_size < 10000:
+        logger.warning(
+            "LSTM weights are missing or invalid: %s. "
+            "Action recognition is disabled.",
+            lstm_path,
+        )
+    else:
+        try:
+            checkpoint = torch.load(
+                str(lstm_path),
+                map_location=device,
+                weights_only=True,
+            )
+
+            class_map = checkpoint["class_map"]
+
+            lstm_model = BidirectionalLSTM(
+                checkpoint["input_size"],
+                checkpoint["hidden_size"],
+                checkpoint["num_layers"],
+                len(class_map),
+            ).to(device)
+
+            lstm_model.load_state_dict(
+                checkpoint["model_state_dict"]
+            )
+            lstm_model.eval()
+
+            inv_class_map = {
+                int(class_id): str(class_name)
+                for class_name, class_id in class_map.items()
+            }
+
+            logger.info("LSTM model loaded successfully.")
+
+        except Exception:
+            logger.exception(
+                "LSTM loading failed. Continuing without action recognition."
+            )
+            lstm_model = None
+
+    threat_manager = ThreatManager()
+
+    logger.info("YOLO initialized. Device: %s", device)
+
+    return (
+        detector,
+        lstm_model,
+        device,
+        inv_class_map,
+        threat_manager,
+    )
+
+
+# ---------------------------------------------------------------------
+# DETECTION HELPERS
+# ---------------------------------------------------------------------
+
+def run_yolo_detection(detector: YOLODetector, frame: np.ndarray):
+    """Run object detection on a frame."""
+    return detector.predict(
+        frame,
+        conf=CONFIDENCE_THRESHOLD,
+    )
+
+
+# Only map labels that genuinely correspond to the project's
+# weapon/context categories. Do not classify every object as a weapon.
+CANONICAL_NAME_MAP = {
+    "person": PERSON_CLASS_ID,
+    "gun": GUN_CLASS_IDS[0],
+    "firearm": GUN_CLASS_IDS[0],
+    "handgun": GUN_CLASS_IDS[0],
+    "pistol": GUN_CLASS_IDS[0],
+    "rifle": GUN_CLASS_IDS[0],
+    "knife": KNIFE_CLASS_ID,
+    "atm": ATM_CLASS_ID,
+    "backpack": BACKPACK_CLASS_ID,
+    "handbag": HANDBAG_CLASS_ID,
+    "bag": BACKPACK_CLASS_ID,
+}
+
+
+def get_canonical_class_id(
+    detector: YOLODetector,
+    raw_cls_id: int,
+) -> int:
+    """Map a detector class name to the project's canonical class ID."""
+
+    names = detector.class_names
+
+    if not names:
+        return raw_cls_id
+
+    if isinstance(names, dict):
+        raw_name = names.get(raw_cls_id, "")
+    elif isinstance(names, (list, tuple)):
+        raw_name = (
+            names[raw_cls_id]
+            if 0 <= raw_cls_id < len(names)
+            else ""
+        )
+    else:
+        return raw_cls_id
+
+    canonical_name = str(raw_name).strip().lower()
+
+    return CANONICAL_NAME_MAP.get(
+        canonical_name,
+        raw_cls_id,
+    )
+
+
+def parse_detections(
+    detector: YOLODetector,
+    results,
+) -> Tuple[List, List[int]]:
+    """Extract person tracking detections and recognized weapon IDs."""
+
+    detections_for_tracking = []
+    visible_weapons = []
+
+    for result in results:
+        if result.boxes is None:
+            continue
+
+        for box in result.boxes:
+            coords = box.xyxy[0].tolist()
+            x1, y1, x2, y2 = map(int, coords)
+
+            confidence = float(box.conf[0])
+            raw_class_id = int(box.cls[0])
+
+            class_id = get_canonical_class_id(
+                detector,
+                raw_class_id,
+            )
+
+            if class_id in WEAPON_CLASS_IDS:
+                visible_weapons.append(class_id)
+
+            elif class_id == PERSON_CLASS_ID:
+                detections_for_tracking.append(
+                    ([x1, y1, x2, y2], confidence, class_id)
+                )
+
+    return detections_for_tracking, visible_weapons
+
+
+def draw_weapon_boxes(
+    detector: YOLODetector,
+    frame: np.ndarray,
+    results,
+) -> List[Dict]:
+    """
+    Draw detected objects.
+
+    Only objects identified as weapons by their detector class are
+    treated as weapons. Ordinary objects are not converted into knives.
+    """
+
+    visible_objects = []
+    names = detector.class_names or {}
+
+    for result in results:
+        if result.boxes is None:
+            continue
+
+        for box in result.boxes:
+            x1, y1, x2, y2 = map(
+                int,
+                box.xyxy[0].tolist(),
+            )
+
+            raw_class_id = int(box.cls[0])
+            confidence = float(box.conf[0])
+
+            if isinstance(names, dict):
+                class_name = str(
+                    names.get(raw_class_id, "Unknown")
+                )
+            elif isinstance(names, (list, tuple)):
+                class_name = (
+                    str(names[raw_class_id])
+                    if 0 <= raw_class_id < len(names)
+                    else "Unknown"
+                )
+            else:
+                class_name = "Unknown"
+
+            if class_name.lower() == "person":
+                continue
+
+            class_id = get_canonical_class_id(
+                detector,
+                raw_class_id,
+            )
+
+            is_weapon = class_id in WEAPON_CLASS_IDS
+
+            # Keep only recognized weapons and configured context objects
+            # in the context list used by threat logic.
+            if not is_weapon and class_id not in CONTEXT_CLASS_IDS:
+                continue
+
+            visible_objects.append({
+                "class": class_name,
+                "class_id": class_id,
+                "confidence": confidence,
+                "bbox": [x1, y1, x2, y2],
+            })
+
+            color = (
+                (0, 0, 255)
+                if is_weapon
+                else get_color(class_id)
+            )
+
+            cv2.rectangle(
+                frame,
+                (x1, y1),
+                (x2, y2),
+                color,
+                2,
+            )
+
+            label = f"{class_name.upper()} ({confidence:.2f})"
+
+            label_y = max(20, y1 - 8)
+
+            cv2.putText(
+                frame,
+                label,
+                (max(0, x1), label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+            )
+
+    return visible_objects
+
+
+# ---------------------------------------------------------------------
+# PERSON TRACKING, POSE AND ACTION RECOGNITION
+# ---------------------------------------------------------------------
+
+def update_person_history(
+    pose_estimator: MediaPipeEstimator,
+    frame: np.ndarray,
+    tracked_objects,
+    person_history: Dict[int, Deque[List[float]]],
+    device,
+    lstm_model,
+    inv_class_map,
+    threat_manager: ThreatManager,
+    context_detections: List[Dict],
+    person_durations: Dict[int, float],
+    is_unattended_bag: bool,
+    frame_id: int = 0,
+):
+    """Process tracked people, optional action recognition, and alerts."""
+
+    image_height, image_width = frame.shape[:2]
+    threat_messages = []
+
+    if len(tracked_objects) == 0:
+        return threat_messages
+
+    visible_object_ids = [
+        detection["class_id"]
+        for detection in context_detections
+    ]
+
+    has_atm = ATM_CLASS_ID in visible_object_ids
+
+    for index in range(len(tracked_objects)):
+        x1, y1, x2, y2 = map(
+            int,
+            tracked_objects.xyxy[index],
+        )
+
+        track_id = int(tracked_objects.tracker_id[index])
+
+        confidence_values = getattr(
+            tracked_objects,
+            "confidence",
+            None,
+        )
+
+        confidence = (
+            float(confidence_values[index])
+            if confidence_values is not None
+            else 0.0
+        )
+
+        if track_id not in person_history:
+            person_history[track_id] = deque(
+                maxlen=SEQUENCE_LENGTH
+            )
+
+        x1c = max(0, min(image_width, x1))
+        y1c = max(0, min(image_height, y1))
+        x2c = max(0, min(image_width, x2))
+        y2c = max(0, min(image_height, y2))
+
+        person_crop = frame[y1c:y2c, x1c:x2c]
+
+        landmarks_list = None
+
+        if person_crop.size > 0:
+            landmarks_list, _ = pose_estimator.predict(
+                person_crop
+            )
+
+        if landmarks_list is not None:
+            person_history[track_id].append(landmarks_list)
+        elif person_history[track_id]:
+            person_history[track_id].append(
+                [0.0] * 132
+            )
+
+        action_label = "normal"
+        action_probability = 0.0
+
+        if (
+            lstm_model is not None
+            and len(person_history[track_id]) == SEQUENCE_LENGTH
+        ):
+            sequence = np.asarray(
+                person_history[track_id],
+                dtype=np.float32,
+            )
+
+            sequence_tensor = torch.as_tensor(
+                sequence,
+                dtype=torch.float32,
+            ).unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                output = lstm_model(sequence_tensor)
+                probabilities = torch.softmax(output, dim=1)
+                top_probability, top_class = torch.max(
+                    probabilities,
+                    dim=1,
+                )
+
+            if (
+                top_probability.item()
+                > ACTION_CONFIDENCE_THRESHOLD
+            ):
+                predicted_class = int(top_class.item())
+
+                action_label = inv_class_map.get(
+                    predicted_class,
+                    "normal",
+                )
+                action_probability = float(
+                    top_probability.item()
+                )
+
+        duration = person_durations.get(track_id, 0.0)
+
+        threat_level, box_color = threat_manager.determine_threat(
+            action_label,
+            visible_object_ids,
+            duration,
+            is_unattended_bag,
+        )
+
+        person_detection = {
+            "class": "Person",
+            "confidence": confidence,
+            "bbox": [x1, y1, x2, y2],
+            "track_id": track_id,
+        }
+
+        all_detections = (
+            [person_detection] + context_detections
+        )
+
+        spatial_context = {
+            "atm_present": has_atm,
+            "near_atm": has_atm,
+        }
+
+        threat_manager.log_threat(
+            track_id,
+            "Stream",
+            action_label,
+            action_probability,
+            threat_level,
+            frame_id=frame_id,
+            detections=all_detections,
+            spatial_context=spatial_context,
+            frame=frame,
+        )
+
+        if DRAW_PERSON_BOXES:
+            cv2.rectangle(
+                frame,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),
+                2,
+            )
+
+            if DRAW_LABELS:
+                label = f"ID:{track_id} ({int(duration)}s)"
+
+                cv2.putText(
+                    frame,
+                    label,
+                    (max(0, x1), max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 0),
+                    2,
+                )
+
+        if threat_level != "SAFE":
+            message = (
+                f"ID {track_id}: {threat_level} "
+                f"({action_label})"
+            )
+            threat_messages.append(message)
+
+            if DRAW_LABELS:
+                cv2.putText(
+                    frame,
+                    threat_level,
+                    (max(0, x1), min(image_height - 5, y2 + 25)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    box_color,
+                    2,
+                )
+
+    return threat_messages
+
+
+# ---------------------------------------------------------------------
+# FRAME PROCESSING
+# ---------------------------------------------------------------------
+
+def process_frame(
+    frame: np.ndarray,
+    detector,
+    lstm_model,
+    device,
+    inv_class_map,
+    threat_manager: ThreatManager,
+    tracker: ByteTracker,
+    pose_estimator: MediaPipeEstimator,
+    person_history: Dict[int, Deque[List[float]]],
+    state_data: Dict = None,
+    dt: float = 0.05,
+):
+    """
+    Process one video frame.
+
+    Returns:
+        processed_frame, threat_messages
+    """
+
+    if state_data is None:
+        state_data = {
+            "person_durations": {},
+            "unattended_bag_timer": 0.0,
+            "frame_count": 0,
+        }
+
+    state_data.setdefault("person_durations", {})
+    state_data.setdefault("unattended_bag_timer", 0.0)
+    state_data.setdefault("frame_count", 0)
+
+    results = run_yolo_detection(
+        detector,
+        frame,
+    )
+
+    context_detections = draw_weapon_boxes(
+        detector,
+        frame,
+        results,
+    )
+
+    visible_object_ids = [
+        detection["class_id"]
+        for detection in context_detections
+    ]
+
+    has_bag = any(
+        class_id in (BACKPACK_CLASS_ID, HANDBAG_CLASS_ID)
+        for class_id in visible_object_ids
+    )
+
+    detections_for_tracking, _ = parse_detections(
+        detector,
+        results,
+    )
+
+    tracked_objects = tracker.update(
+        detections_for_tracking
+    )
+
+    person_count = len(tracked_objects)
+
+    if has_bag and person_count == 0:
+        state_data["unattended_bag_timer"] += max(
+            0.0,
+            dt,
+        )
+    else:
+        state_data["unattended_bag_timer"] = 0.0
+
+    is_unattended_bag = (
+        state_data["unattended_bag_timer"]
+        > UNATTENDED_BAG_THRESHOLD
+    )
+
+    for index in range(person_count):
+        track_id = int(
+            tracked_objects.tracker_id[index]
+        )
+
+        state_data["person_durations"][track_id] = (
+            state_data["person_durations"].get(track_id, 0.0)
+            + max(0.0, dt)
+        )
+
+    threat_messages = update_person_history(
+        pose_estimator=pose_estimator,
+        frame=frame,
+        tracked_objects=tracked_objects,
+        person_history=person_history,
+        device=device,
+        lstm_model=lstm_model,
+        inv_class_map=inv_class_map,
+        threat_manager=threat_manager,
+        context_detections=context_detections,
+        person_durations=state_data["person_durations"],
+        is_unattended_bag=is_unattended_bag,
+        frame_id=state_data["frame_count"],
+    )
+
+    state_data["frame_count"] += 1
+
+    if is_unattended_bag and person_count == 0:
+        spatial_context = {
+            "atm_present": ATM_CLASS_ID in visible_object_ids,
+            "near_atm": False,
+        }
+
+        threat_level, threat_color = (
+            threat_manager.determine_threat(
+                "normal",
+                visible_object_ids,
+                0.0,
+                True,
+            )
+        )
+
+        if threat_level != "SAFE":
+            threat_messages.append(
+                f"Unattended bag: {threat_level}"
+            )
+
+            threat_manager.log_threat(
+                0,
+                "Stream",
+                "unattended",
+                1.0,
+                threat_level,
+                frame_id=state_data["frame_count"],
+                detections=context_detections,
+                spatial_context=spatial_context,
+                frame=frame,
+            )
+
+            if DRAW_LABELS:
+                cv2.putText(
+                    frame,
+                    threat_level,
+                    (30, 45),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    threat_color,
+                    2,
+                )
+
+    return frame, threat_messages
+
+
+# ---------------------------------------------------------------------
+# OFFLINE VIDEO / WEBCAM PIPELINE
+# ---------------------------------------------------------------------
+
+def run_offline_pipeline():
+    """Run detection on videos in the input folder or on the webcam."""
+
+    print("Initializing SmartVision Pro...")
+
+    (
+        detector,
+        lstm_model,
+        device,
+        inv_class_map,
+        threat_manager,
+    ) = load_models()
+
+    if detector is None:
+        logger.error("No usable YOLO model. Pipeline stopped.")
+        return
+
+    tracker = ByteTracker()
+    pose_estimator = MediaPipeEstimator()
+    person_history = {}
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    input_videos = []
+
+    if os.path.isdir(INPUT_VIDEO_DIR):
+        input_videos = [
+            filename
+            for filename in os.listdir(INPUT_VIDEO_DIR)
+            if filename.lower().endswith(
+                (".mp4", ".avi", ".mkv", ".mov")
+            )
+        ]
+
+    if input_videos:
+        for video_file in input_videos:
+            input_path = os.path.join(
+                INPUT_VIDEO_DIR,
+                video_file,
+            )
+
+            output_path = os.path.join(
+                RESULTS_DIR,
+                f"output_{Path(video_file).stem}.mp4",
+            )
+
+            _run_single_source_offline(
+                input_path,
+                output_path,
+                detector,
+                lstm_model,
+                device,
+                inv_class_map,
+                threat_manager,
+                tracker,
+                pose_estimator,
+                person_history,
+            )
+    else:
+        logger.info(
+            "No input videos found. Starting webcam %s.",
+            WEBCAM_ID,
+        )
+
+        _run_single_source_offline(
+            WEBCAM_ID,
+            os.path.join(RESULTS_DIR, "webcam_session.mp4"),
+            detector,
+            lstm_model,
+            device,
+            inv_class_map,
+            threat_manager,
+            tracker,
+            pose_estimator,
+            person_history,
+        )
+
+
+def _run_single_source_offline(
+    source_path,
+    output_path,
+    detector,
+    lstm_model,
+    device,
+    inv_class_map,
+    threat_manager,
+    tracker,
+    pose_estimator,
+    person_history,
+):
+    """Read a video or webcam, process frames, and save output."""
+
+    is_webcam = source_path == WEBCAM_ID
+
+    source_name = (
+        "Webcam"
+        if is_webcam
+        else f"File: {os.path.basename(source_path)}"
+    )
+
+    logger.info("Starting source: %s", source_name)
+
+    capture = cv2.VideoCapture(source_path)
+
+    if not capture.isOpened():
+        logger.error("Cannot open source: %s", source_name)
+        return
+
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = capture.get(cv2.CAP_PROP_FPS)
+
+    if not fps or np.isnan(fps) or fps <= 0:
+        fps = 20.0
+
+    writer = None
+
+    if output_path and width > 0 and height > 0:
+        os.makedirs(
+            os.path.dirname(output_path) or ".",
+            exist_ok=True,
+        )
+
+        writer = cv2.VideoWriter(
+            output_path,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+
+        if not writer.isOpened():
+            logger.warning(
+                "Could not create output video: %s",
+                output_path,
+            )
+            writer.release()
+            writer = None
+
+    state_data = {
+        "person_durations": {},
+        "unattended_bag_timer": 0.0,
+        "frame_count": 0,
+    }
+
+    last_time = time.time()
+
+    try:
+        while True:
+            success, frame = capture.read()
+
+            if not success:
+                break
+
+            current_time = time.time()
+
+            if is_webcam:
+                dt = max(
+                    0.001,
+                    current_time - last_time,
+                )
+            else:
+                dt = 1.0 / fps
+
+            last_time = current_time
+
+            processed_frame, _ = process_frame(
+                frame=frame,
+                detector=detector,
+                lstm_model=lstm_model,
+                device=device,
+                inv_class_map=inv_class_map,
+                threat_manager=threat_manager,
+                tracker=tracker,
+                pose_estimator=pose_estimator,
+                person_history=person_history,
+                state_data=state_data,
+                dt=dt,
+            )
+
+            if writer is not None:
+                writer.write(processed_frame)
+
+            cv2.imshow(
+                "SmartVision Pro - Threat Detection",
+                processed_frame,
+            )
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    finally:
+        capture.release()
+
+        if writer is not None:
+            writer.release()
+
+        cv2.destroyAllWindows()
+
+    logger.info("Finished source: %s", source_name)
+
+
+if __name__ == "__main__":
+    run_offline_pipeline()

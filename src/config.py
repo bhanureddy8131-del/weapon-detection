@@ -7,15 +7,37 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # --- PATHS ---
 YOLO_MODEL_PATH = os.path.join(ROOT_DIR, "models", "yolo11s_fine_tune_v3.pt")
 LSTM_MODEL_PATH = os.path.join(ROOT_DIR, "models", "lstm_action_recognition_pro_v2.pth")
+POSE_MODEL_PATH = os.getenv(
+    "SMARTVISION_POSE_MODEL_PATH",
+    os.path.join(ROOT_DIR, "models", "pose_landmarker_lite.task"),
+)
 INPUT_VIDEO_DIR = os.path.join(ROOT_DIR, "data", "input_videos")
 RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 LOG_DIR = os.path.join(ROOT_DIR, "logs")
-SERVER_URL = "http://localhost:8000/api/v1/incidents"
+API_BASE_URL = os.getenv(
+    "SMARTVISION_API_BASE_URL",
+    "http://127.0.0.1:8000/api/v1",
+).rstrip("/")
+SERVER_URL = f"{API_BASE_URL}/incidents"
 
 # --- PARAMETERS ---
 WEBCAM_ID = 0
-CONFIDENCE_THRESHOLD = 0.10
-ACTION_CONFIDENCE_THRESHOLD = 0.85 # Minimum confidence for LSTM action recognition
+CONFIDENCE_THRESHOLD = float(
+    os.getenv("SMARTVISION_CONFIDENCE_THRESHOLD", "0.10")
+)
+YOLO_IMAGE_SIZE = int(os.getenv("SMARTVISION_YOLO_IMAGE_SIZE", "416"))
+YOLO_IOU_THRESHOLD = float(os.getenv("SMARTVISION_YOLO_IOU", "0.70"))
+EXPECTED_DETECTOR_CLASSES = (
+    "atm",
+    "backpack",
+    "gun",
+    "handbag",
+    "knife",
+    "person",
+)
+ACTION_CONFIDENCE_THRESHOLD = float(
+    os.getenv("SMARTVISION_ACTION_CONFIDENCE_THRESHOLD", "0.85")
+)
 SEQUENCE_LENGTH = 30  # Must match training
 
 DRAW_PERSON_BOXES = True # Draw bounding boxes for persons
@@ -45,6 +67,17 @@ BACKPACK_CLASS_ID = 1
 HANDBAG_CLASS_ID = 3
 
 CONTEXT_CLASS_IDS = [0, 1, 3] # ATM, Backpack, Handbag
+CLASS_CONFIDENCE_THRESHOLDS = {
+    PERSON_CLASS_ID: float(
+        os.getenv("SMARTVISION_PERSON_CONFIDENCE", str(CONFIDENCE_THRESHOLD))
+    ),
+    GUN_CLASS_IDS[0]: float(
+        os.getenv("SMARTVISION_GUN_CONFIDENCE", str(CONFIDENCE_THRESHOLD))
+    ),
+    KNIFE_CLASS_ID: float(
+        os.getenv("SMARTVISION_KNIFE_CONFIDENCE", str(CONFIDENCE_THRESHOLD))
+    ),
+}
 
 # --- TIME THRESHOLDS ---
 ATM_LOITERING_THRESHOLD = 60.0  # Seconds

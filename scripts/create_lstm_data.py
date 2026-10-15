@@ -2,6 +2,8 @@ import os
 import cv2
 import numpy as np
 import sys
+import torch
+from pathlib import Path
 from ultralytics import YOLO
 from tqdm import tqdm
 
@@ -10,20 +12,23 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
 sys.path.append(project_root)
 
-try:
-    from src.modeling.pose_estimators.mediapipe_estimator import MediaPipeEstimator
-except ImportError:
-    print("❌ Error: Could not import MediaPipeEstimator.")
-    sys.exit(1)
+from src.config import ROOT_DIR, SEQUENCE_LENGTH
+from src.modeling.classifiers.lstm import (
+    POSE_FEATURE_LAYOUT,
+    POSE_FEATURE_SIZE,
+)
+from src.modeling.pose_estimators.mediapipe import MediaPipeEstimator
 
 # --- CONFIGURATION ---
-VIDEOS_DIR = os.path.expanduser("~/Desktop/dataset/split_clips") 
-OUTPUT_DIR = os.path.expanduser("~/Desktop/dataset/lstm_data")
-DEBUG_VIDEO_DIR = os.path.expanduser("~/Desktop/dataset/debug_videos") 
+VIDEOS_DIR = Path(os.getenv(
+    "SMARTVISION_ACTION_VIDEO_DIR",
+    str(Path.home() / "Desktop" / "dataset" / "split_clips"),
+))
+OUTPUT_DIR = Path(ROOT_DIR) / "data" / "processed" / "lstm_data"
+DEBUG_VIDEO_DIR = Path(ROOT_DIR) / "data" / "processed" / "lstm_debug_videos"
 
-SEQUENCE_LENGTH = 30
 STEP_SIZE = 10
-YOLO_MODEL_SIZE = "yolov11x.pt" 
+YOLO_MODEL_SIZE = str(Path(ROOT_DIR) / "yolo11s.pt")
 
 # THRESHOLDS
 ENERGY_THRESHOLD = 0.08  # Min movement to be considered "Action" (Filters statues)
@@ -62,19 +67,49 @@ def calculate_pose_energy(landmarks):
     return energy
 
 def extract_features():
+    if not VIDEOS_DIR.is_dir():
+        raise FileNotFoundError(
+            f"Labeled action clips were not found at {VIDEOS_DIR}. "
+            "Set SMARTVISION_ACTION_VIDEO_DIR to the labeled clip directory."
+        )
+
+    class_directories = sorted(
+        path for path in VIDEOS_DIR.iterdir() if path.is_dir()
+    )
+    class_names = {path.name.strip().lower() for path in class_directories}
+    expected_classes = {"normal", "fighting", "shooting"}
+    if class_names != expected_classes:
+        raise ValueError(
+            "Labeled clip folders must be exactly "
+            f"{sorted(expected_classes)}; found {sorted(class_names)}."
+        )
+
     print(f"⏳ Loading YOLO Model ({YOLO_MODEL_SIZE})...")
     yolo_model = YOLO(YOLO_MODEL_SIZE)
     if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
          yolo_model.to('mps')
 
     pose_estimator = MediaPipeEstimator()
+    if not pose_estimator.available:
+        raise RuntimeError(
+            "MediaPipe Pose is unavailable; cannot create LSTM training data. "
+            + pose_estimator.diagnostic
+        )
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
     all_tasks = []
-    classes = [d for d in os.listdir(VIDEOS_DIR) if os.path.isdir(os.path.join(VIDEOS_DIR, d))]
-    for class_name in classes:
-        files = [f for f in os.listdir(os.path.join(VIDEOS_DIR, class_name)) if f.endswith(('.mp4', '.avi', '.mkv'))]
+    classes = class_directories
+    for class_directory in classes:
+        class_name = class_directory.name.strip().lower()
+        files = [
+            path
+            for path in class_directory.iterdir()
+            if path.is_file() and path.suffix.lower() in (".mp4", ".avi", ".mkv", ".mov")
+        ]
         for f in files:
-            all_tasks.append({'path': os.path.join(VIDEOS_DIR, class_name, f), 'class': class_name, 'name': f})
+            all_tasks.append({'path': str(f), 'class': class_name, 'name': f.name})
+    if not all_tasks:
+        raise ValueError(f"No labeled action video clips were found under {VIDEOS_DIR}.")
             
     for task in tqdm(all_tasks, desc="Multi-Person Extraction"):
         video_path, class_name, video_name = task['path'], task['class'], task['name']
@@ -86,7 +121,7 @@ def extract_features():
         os.makedirs(os.path.dirname(debug_path), exist_ok=True)
         out = cv2.VideoWriter(debug_path, cv2.VideoWriter_fourcc(*'mp4v'), int(cap.get(5)), (width, height))
         
-        # ACTIVE TRACKS: { track_id: [landmark_list] }
+        # Missing pose frames split a track into separate valid sequences.
         active_tracks = {}
         next_track_id = 0
         
@@ -143,16 +178,21 @@ def extract_features():
                 energy = 0.0
                 if crop.size > 0:
                     landmarks, _ = pose_estimator.predict(crop)
-                    if landmarks:
+                    if (
+                        landmarks is not None
+                        and len(landmarks) == POSE_FEATURE_SIZE
+                        and np.isfinite(landmarks).all()
+                    ):
                         energy = calculate_pose_energy(landmarks)
+                    else:
+                        landmarks = None
                 
                 # SAVE DATA (Only if we have landmarks)
-                if landmarks:
-                    active_tracks[track_id].append({'lm': landmarks, 'energy': energy})
-                else:
-                    # Pad if missed, but don't increment energy
-                    if len(active_tracks[track_id]) > 0:
-                         active_tracks[track_id].append({'lm': [0.0]*132, 'energy': 0.0})
+                active_tracks[track_id].append(
+                    {"lm": landmarks, "energy": energy}
+                    if landmarks is not None
+                    else None
+                )
 
                 # DEBUG DRAW
                 color = (0, 255, 0) if energy > ENERGY_THRESHOLD else (0, 100, 100) # Bright Green = Saved
@@ -165,30 +205,43 @@ def extract_features():
         cap.release()
         out.release()
         
-        # --- SAVE FILTERED TRACKS ---
+        # --- SAVE COMPLETE WINDOWS OF CONSECUTIVE VALID POSES ---
         for tid, track_data in active_tracks.items():
-            # Filter 1: Must be long enough
-            if len(track_data) < SEQUENCE_LENGTH: continue
-            
-            # Filter 2: Must be "Violent" (Avg Energy check) if class is violence
-            # If class is Normal, we keep everything.
-            avg_energy = np.mean([t['energy'] for t in track_data])
-            
-            if class_name == 'violence' and avg_energy < ENERGY_THRESHOLD:
-                continue # Skip bystander
-                
-            # Convert to numpy array
-            landmarks_only = [t['lm'] for t in track_data]
-            data_points = np.array(landmarks_only)
-            
-            # Sliding Window
+            valid_segments = []
+            current_segment = []
+            for pose_frame in track_data:
+                if pose_frame is None:
+                    if current_segment:
+                        valid_segments.append(current_segment)
+                        current_segment = []
+                    continue
+                current_segment.append(pose_frame["lm"])
+            if current_segment:
+                valid_segments.append(current_segment)
+
+            class_output_dir = OUTPUT_DIR / class_name
+            class_output_dir.mkdir(parents=True, exist_ok=True)
             num_sequences = 0
-            for i in range(0, len(data_points) - SEQUENCE_LENGTH, STEP_SIZE):
-                sequence = data_points[i : i + SEQUENCE_LENGTH]
-                save_name = f"{class_name}_{video_name.split('.')[0]}_id{tid}_{num_sequences}.npy"
-                np.save(os.path.join(OUTPUT_DIR, class_name, save_name), sequence)
-                num_sequences += 1
+            for segment in valid_segments:
+                if len(segment) < SEQUENCE_LENGTH:
+                    continue
+                data_points = np.asarray(segment, dtype=np.float32)
+                for start in range(
+                    0,
+                    len(data_points) - SEQUENCE_LENGTH + 1,
+                    STEP_SIZE,
+                ):
+                    sequence = data_points[start:start + SEQUENCE_LENGTH]
+                    if sequence.shape != (SEQUENCE_LENGTH, POSE_FEATURE_SIZE):
+                        continue
+                    save_name = (
+                        f"{class_name}_{Path(video_name).stem}_"
+                        f"id{tid}_{num_sequences}.npy"
+                    )
+                    np.save(class_output_dir / save_name, sequence)
+                    num_sequences += 1
+
+    pose_estimator.close()
 
 if __name__ == "__main__":
-    import torch
     extract_features()

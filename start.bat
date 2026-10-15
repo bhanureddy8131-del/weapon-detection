@@ -2,10 +2,12 @@
 echo Starting SmartVision Pro...
 
 set SCRIPT_DIR=%~dp0
-set PYTHON_EXE=%SCRIPT_DIR%env\Scripts\python.exe
+set PYTHON_EXE=%SCRIPT_DIR%.venv\Scripts\python.exe
+pushd "%SCRIPT_DIR%"
 
 if not exist "%PYTHON_EXE%" (
     echo Error: Python environment not found at %PYTHON_EXE%
+    popd
     pause
     exit /b 1
 )
@@ -19,3 +21,4 @@ echo Starting SmartVision UI on http://localhost:8501 ...
 start "SmartVision Dashboard" "%PYTHON_EXE%" -m streamlit run pipeline/app.py --server.port 8501
 
 echo System started in separate windows.
+popd

@@ -1,6 +1,10 @@
+import logging
+from pathlib import Path
+
 import mediapipe as mp
 import cv2
-import numpy as np
+
+from src.config import POSE_MODEL_PATH
 
 
 class MediaPipeEstimator:
@@ -10,29 +14,67 @@ class MediaPipeEstimator:
     """
 
     def __init__(self):
-        print("[INFO] Initializing MediaPipe Pose...")
-        self.available = hasattr(mp, "solutions") and hasattr(mp.solutions, "pose")
-        if self.available:
-            try:
-                self.mp_pose = mp.solutions.pose
-                self.mp_drawing = mp.solutions.drawing_utils
-                self.mp_drawing_styles = mp.solutions.drawing_styles
+        self.available = False
+        self.diagnostic = ""
+        self.last_elapsed_ms = 0.0
+        self.pose = None
+        self._task_api = False
+        self._mp = mp
 
-                # model_complexity: 0=Fast, 1=Balanced, 2=Accurate
-                # min_detection_confidence: Keep high to avoid noise
+        solutions_api = getattr(mp, "solutions", None)
+        if solutions_api is not None and hasattr(solutions_api, "pose"):
+            try:
+                self.mp_pose = solutions_api.pose
+                self.mp_drawing = solutions_api.drawing_utils
+                self.mp_drawing_styles = solutions_api.drawing_styles
                 self.pose = self.mp_pose.Pose(
                     static_image_mode=False,
-                    model_complexity=1,
+                    model_complexity=0,
                     min_detection_confidence=0.5,
                     min_tracking_confidence=0.5,
                 )
-            except Exception as e:
-                print(f"[WARNING] Failed to initialize mp.solutions.pose: {e}")
-                self.available = False
-                self.pose = None
-        else:
-            print("[WARNING] MediaPipe solutions API is not available on this Python/MediaPipe version. Pose estimation skipped.")
+                self.available = True
+                self.diagnostic = "MediaPipe Pose legacy API initialized."
+                return
+            except Exception as exc:
+                self.diagnostic = f"Legacy MediaPipe Pose initialization failed: {exc}"
+                logging.exception(self.diagnostic)
+
+        model_path = Path(POSE_MODEL_PATH)
+        if not model_path.is_file():
+            api_note = (
+                "The installed MediaPipe package exposes Tasks, not "
+                "solutions.pose."
+                if solutions_api is None or not hasattr(solutions_api, "pose")
+                else "The legacy Pose API could not be initialized."
+            )
+            self.diagnostic = (
+                f"{api_note} Pose Landmarker model is missing at {model_path}. "
+                "Download pose_landmarker_lite.task using the command in README.md."
+            )
+            return
+
+        try:
+            from mediapipe.tasks.python import BaseOptions
+            from mediapipe.tasks.python import vision
+
+            options = vision.PoseLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=str(model_path)),
+                running_mode=vision.RunningMode.IMAGE,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+                output_segmentation_masks=False,
+            )
+            self.pose = vision.PoseLandmarker.create_from_options(options)
+            self._task_api = True
+            self.available = True
+            self.diagnostic = f"MediaPipe Pose Landmarker loaded from {model_path}."
+        except Exception as exc:
             self.pose = None
+            self.diagnostic = f"MediaPipe Pose Landmarker initialization failed: {exc}"
+            logging.exception(self.diagnostic)
 
     def predict(self, person_crop):
         """
@@ -43,30 +85,60 @@ class MediaPipeEstimator:
         if not self.available or self.pose is None:
             return None, None
 
+        started_at = cv2.getTickCount()
         try:
-            # 1. Convert BGR to RGB (MediaPipe requires RGB)
             img_rgb = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
-            results = self.pose.process(img_rgb)
+            if self._task_api:
+                image = self._mp.Image(
+                    image_format=self._mp.ImageFormat.SRGB,
+                    data=img_rgb,
+                )
+                results = self.pose.detect(image)
+                pose_landmarks = (
+                    results.pose_landmarks[0]
+                    if results.pose_landmarks
+                    else None
+                )
+            else:
+                results = self.pose.process(img_rgb)
+                pose_landmarks = (
+                    results.pose_landmarks
+                    if results and results.pose_landmarks
+                    else None
+                )
 
-            # 3. Process Results
-            if results and results.pose_landmarks:
-                # We flatten the data for the LSTM
-                # 33 landmarks * 4 values (x, y, z, vis) = 132 features per frame
-                landmarks = []
-                for lm in results.pose_landmarks.landmark:
-                    landmarks.extend([lm.x, lm.y, lm.z, lm.visibility])
+            if pose_landmarks is None:
+                return None, None
 
-                return landmarks, results.pose_landmarks
-        except Exception as e:
-            print(f"[WARNING] MediaPipe prediction error: {e}")
-
-        return None, None
+            landmark_items = (
+                pose_landmarks.landmark
+                if hasattr(pose_landmarks, "landmark")
+                else pose_landmarks
+            )
+            landmarks = []
+            for landmark in landmark_items:
+                landmarks.extend([
+                    landmark.x,
+                    landmark.y,
+                    landmark.z,
+                    getattr(landmark, "visibility", 0.0),
+                ])
+            return landmarks, pose_landmarks
+        except Exception as exc:
+            self.diagnostic = f"MediaPipe pose inference failed: {exc}"
+            logging.exception(self.diagnostic)
+            return None, None
+        finally:
+            elapsed_ticks = cv2.getTickCount() - started_at
+            self.last_elapsed_ms = (
+                elapsed_ticks / cv2.getTickFrequency() * 1000
+            )
 
     def visualize(self, person_crop, landmarks_object):
         """
         Draws the skeleton on the cropped image in-place.
         """
-        if not self.available or landmarks_object is None:
+        if not self.available or landmarks_object is None or self._task_api:
             return person_crop
 
         try:
@@ -76,6 +148,12 @@ class MediaPipeEstimator:
                 self.mp_pose.POSE_CONNECTIONS,
                 landmark_drawing_spec=self.mp_drawing_styles.get_default_pose_landmarks_style(),
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.exception("Could not draw MediaPipe pose landmarks: %s", exc)
         return person_crop
+
+    def close(self):
+        if self.pose is not None:
+            self.pose.close()
+            self.pose = None
+            self.available = False

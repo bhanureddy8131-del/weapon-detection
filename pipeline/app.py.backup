@@ -1,0 +1,1111 @@
+
+from __future__ import annotations
+
+import inspect
+import logging
+import os
+import sys
+import time
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# ---------------------------------------------------------
+# Project configuration
+# ---------------------------------------------------------
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("smartvision")
+
+st.set_page_config(
+    page_title="SmartVision Pro",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------------------------------------------------------
+# Dark dashboard styling
+# ---------------------------------------------------------
+
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+    :root {
+        --bg: #080d19;
+        --panel: #111a2b;
+        --panel2: #151f33;
+        --border: #27354c;
+        --text: #edf3ff;
+        --muted: #91a1bc;
+        --blue: #4f83ff;
+        --cyan: #22d3ee;
+        --red: #ff5263;
+        --green: #36d399;
+        --amber: #fbbf24;
+    }
+
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+    }
+
+    .stApp {
+        background:
+            radial-gradient(ellipse at 10% 0%, #13264a 0%, transparent 35%),
+            var(--bg);
+        color: var(--text);
+    }
+
+    [data-testid="stHeader"] {
+        background: rgba(8,13,25,.85);
+    }
+
+    [data-testid="stSidebar"] {
+        background: #0b1221;
+        border-right: 1px solid var(--border);
+    }
+
+    [data-testid="stSidebar"] * {
+        color: var(--text);
+    }
+
+    h1, h2, h3 {
+        color: var(--text) !important;
+        letter-spacing: -.5px;
+    }
+
+    p, label, .stMarkdown {
+        color: var(--text);
+    }
+
+    .hero {
+        padding: 25px 28px;
+        border-radius: 20px;
+        border: 1px solid #2b4168;
+        background: linear-gradient(120deg, #14284b, #101a2d 65%, #11182a);
+        margin-bottom: 22px;
+    }
+
+    .hero-kicker {
+        color: #80a9ff;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 2px;
+        text-transform: uppercase;
+    }
+
+    .hero-title {
+        font-size: 32px;
+        font-weight: 800;
+        margin: 8px 0;
+        color: #f4f7ff;
+    }
+
+    .hero-subtitle {
+        color: #a8bad8;
+        font-size: 14px;
+        line-height: 1.7;
+    }
+
+    .metric-card {
+        background: linear-gradient(145deg, #141f33, #101827);
+        border: 1px solid var(--border);
+        border-radius: 15px;
+        padding: 18px;
+        min-height: 116px;
+    }
+
+    .metric-label {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: .8px;
+    }
+
+    .metric-value {
+        font-size: 29px;
+        font-weight: 800;
+        color: #f4f7ff;
+        margin-top: 10px;
+    }
+
+    .metric-note {
+        color: #91a1bc;
+        font-size: 11px;
+        margin-top: 5px;
+    }
+
+    .section-card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 15px;
+        padding: 18px;
+        margin-bottom: 15px;
+    }
+
+    .section-label {
+        color: #9bbcff;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 1.4px;
+        text-transform: uppercase;
+        margin-bottom: 10px;
+    }
+
+    .status-pill {
+        display: inline-block;
+        padding: 6px 11px;
+        border-radius: 20px;
+        font-size: 11px;
+        font-weight: 800;
+        background: #183b34;
+        color: #69efbd;
+        border: 1px solid #28634f;
+    }
+
+    .warning-note {
+        background: #302719;
+        color: #ffda83;
+        border: 1px solid #705324;
+        padding: 12px 15px;
+        border-radius: 10px;
+        font-size: 12px;
+        margin: 10px 0;
+    }
+
+    .stButton > button,
+    .stDownloadButton > button {
+        border-radius: 10px;
+        min-height: 42px;
+        font-weight: 700;
+        border: 1px solid #385a9d;
+    }
+
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(100deg, #3267e8, #4f83ff);
+        color: white;
+        border: none;
+    }
+
+    [data-testid="stFileUploader"] {
+        background: #101a2b;
+        border: 1px dashed #385174;
+        border-radius: 12px;
+        padding: 10px;
+    }
+
+    [data-testid="stDataFrame"] {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+    }
+
+    div[data-baseweb="select"] > div,
+    div[data-baseweb="input"] > div {
+        background: #101a2b;
+        border-color: #34435d;
+    }
+
+    hr {
+        border-color: var(--border);
+    }
+
+    footer {
+        visibility: hidden;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------------------------------------------------
+# Session state
+# ---------------------------------------------------------
+
+DEFAULTS = {
+    "incidents": [],
+    "model_bundle": None,
+    "model_load_error": None,
+    "processed_frames": 0,
+    "last_frame": None,
+    "last_source": "None",
+    "alerts_enabled": True,
+    "monitoring_enabled": True,
+}
+
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+# ---------------------------------------------------------
+# Existing inference integration
+# ---------------------------------------------------------
+
+def load_existing_models():
+    """Load models using the project's existing inference function."""
+    if st.session_state.model_bundle is not None:
+        return st.session_state.model_bundle
+
+    try:
+        from pipeline.run_inference import load_models
+
+        bundle = load_models()
+
+        if not isinstance(bundle, (tuple, list)):
+            raise RuntimeError("load_models() returned an unexpected result.")
+
+        if len(bundle) < 5:
+            raise RuntimeError(
+                "Expected five values from load_models(): "
+                "detector, LSTM model, device, class map, threat manager."
+            )
+
+        st.session_state.model_bundle = tuple(bundle[:5])
+        st.session_state.model_load_error = None
+        return st.session_state.model_bundle
+
+    except Exception as exc:
+        logger.exception("Could not load the existing inference models.")
+        st.session_state.model_load_error = str(exc)
+        return None
+
+
+def run_existing_inference(frame: np.ndarray):
+    """
+    Call the existing process_frame() function without replacing it.
+
+    Parameter names are inspected to support common function signatures.
+    If the existing function requires a different signature, the dashboard
+    displays the error instead of silently claiming that detection succeeded.
+    """
+    bundle = load_existing_models()
+
+    if bundle is None:
+        return frame.copy(), [], "Models are not available."
+
+    detector, lstm_model, device, inv_class_map, threat_manager = bundle
+
+    try:
+        from pipeline.run_inference import process_frame
+
+        signature = inspect.signature(process_frame)
+
+        values = {
+            "frame": frame,
+            "image": frame,
+            "img": frame,
+            "image_frame": frame,
+            "frame_bgr": frame,
+            "detector": detector,
+            "yolo_detector": detector,
+            "model": detector,
+            "yolo_model": detector,
+            "lstm_model": lstm_model,
+            "lstm": lstm_model,
+            "action_model": lstm_model,
+            "device": device,
+            "inv_class_map": inv_class_map,
+            "class_map": inv_class_map,
+            "class_names": inv_class_map,
+            "threat_manager": threat_manager,
+            "confidence": st.session_state.get("confidence", 0.35),
+            "conf_threshold": st.session_state.get("confidence", 0.35),
+            "conf": st.session_state.get("confidence", 0.35),
+        }
+
+        args = []
+        kwargs = {}
+
+        # Map known names to their corresponding values.
+        # Use positional arguments if the existing function uses them.
+        fallback = [
+            frame,
+            detector,
+            lstm_model,
+            device,
+            inv_class_map,
+            threat_manager,
+        ]
+        fallback_index = 0
+
+        for name, parameter in signature.parameters.items():
+            if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+                continue
+
+            if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+                continue
+
+            if name in values:
+                value = values[name]
+            elif parameter.default is not inspect.Parameter.empty:
+                continue
+            else:
+                if fallback_index >= len(fallback):
+                    raise RuntimeError(
+                        "Cannot map required process_frame parameter: "
+                        + name
+                    )
+                value = fallback[fallback_index]
+                fallback_index += 1
+
+            if parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
+                args.append(value)
+            else:
+                kwargs[name] = value
+
+        result = process_frame(*args, **kwargs)
+
+        output_frame = frame.copy()
+        detections = []
+
+        if isinstance(result, np.ndarray):
+            output_frame = result
+
+        elif isinstance(result, dict):
+            possible_frame = (
+                result.get("frame")
+                if isinstance(result.get("frame"), np.ndarray)
+                else result.get("annotated_frame")
+            )
+
+            if isinstance(possible_frame, np.ndarray):
+                output_frame = possible_frame
+
+            possible_detections = result.get(
+                "detections", result.get("objects", [])
+            )
+            if isinstance(possible_detections, (list, tuple)):
+                detections = list(possible_detections)
+
+        elif isinstance(result, (tuple, list)):
+            for item in result:
+                if isinstance(item, np.ndarray) and item.ndim >= 2:
+                    output_frame = item
+                    break
+
+            for item in result:
+                if isinstance(item, (list, tuple)) and item:
+                    first = item[0]
+                    if isinstance(first, dict):
+                        detections = list(item)
+                        break
+
+                if isinstance(item, dict) and (
+                    "class" in item
+                    or "label" in item
+                    or "class_name" in item
+                ):
+                    detections.append(item)
+
+        return output_frame, detections, None
+
+    except Exception as exc:
+        logger.exception("Inference failed.")
+        return frame.copy(), [], str(exc)
+
+
+# ---------------------------------------------------------
+# Incident tracking and detection display
+# ---------------------------------------------------------
+
+WEAPON_TERMS = (
+    "gun",
+    "firearm",
+    "pistol",
+    "rifle",
+    "handgun",
+    "knife",
+    "weapon",
+)
+
+def detection_label(item):
+    if isinstance(item, dict):
+        return str(
+            item.get(
+                "class_name",
+                item.get("label", item.get("class", "Unknown")),
+            )
+        )
+
+    if isinstance(item, (tuple, list)) and item:
+        return str(item[0])
+
+    return str(item)
+
+
+def detection_confidence(item):
+    if isinstance(item, dict):
+        for key in ("confidence", "conf", "score"):
+            value = item.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+
+    if isinstance(item, (tuple, list)) and len(item) > 1:
+        if isinstance(item[1], (int, float)):
+            return float(item[1])
+
+    return None
+
+
+def add_incidents(detections, source):
+    """Save visible detections to the session history."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    threshold = float(st.session_state.get("confidence", 0.35))
+    selected_classes = st.session_state.get(
+        "selected_classes", ["Gun / firearm", "Knife"]
+    )
+
+    aliases = {
+        "Gun / firearm": ("gun", "firearm", "pistol", "rifle", "handgun"),
+        "Knife": ("knife",),
+        "Other objects": (),
+    }
+
+    for item in detections:
+        label = detection_label(item)
+        conf = detection_confidence(item)
+        lowered = label.lower()
+
+        if conf is not None and conf < threshold:
+            continue
+
+        matches = [
+            choice for choice in selected_classes
+            if choice == "Other objects"
+            or any(term in lowered for term in aliases.get(choice, ()))
+        ]
+
+        # Do not invent a weapon label for an unknown object.
+        if not matches:
+            continue
+
+        if any(term in lowered for term in WEAPON_TERMS):
+            severity = "High"
+        else:
+            severity = "Review"
+
+        record = {
+            "Time": now,
+            "Class": label,
+            "Confidence": round(conf, 3) if conf is not None else None,
+            "Severity": severity,
+            "Source": source,
+        }
+
+        st.session_state.incidents.append(record)
+
+    # Keep the latest 1,000 records in memory.
+    st.session_state.incidents = st.session_state.incidents[-1000:]
+
+
+def render_frame(frame):
+    if frame is None:
+        return
+
+    if len(frame.shape) == 3:
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    else:
+        frame_rgb = frame
+
+    st.image(frame_rgb, use_container_width=True)
+
+
+# ---------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------
+
+with st.sidebar:
+    st.markdown("## 🛡️ SmartVision Pro")
+    st.caption("VIDEO INTELLIGENCE PLATFORM")
+    st.divider()
+
+    page = st.radio(
+        "NAVIGATION",
+        [
+            "Overview",
+            "Live Monitoring",
+            "Video Upload",
+            "Incident History",
+            "Analytics",
+            "Detection Controls",
+            "Alerts",
+        ],
+        label_visibility="visible",
+    )
+
+    st.divider()
+    st.markdown("### System status")
+
+    if st.session_state.model_bundle is not None:
+        st.success("Inference models loaded")
+    elif st.session_state.model_load_error:
+        st.error("Model loading failed")
+    else:
+        st.info("Models not loaded yet")
+
+    st.markdown(
+        """
+        <div class="warning-note">
+        General-purpose model weights are not proof of reliable weapon
+        detection. Validate detections before using them for security decisions.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Load / Retry Models", use_container_width=True):
+        st.session_state.model_bundle = None
+        st.session_state.model_load_error = None
+        load_existing_models()
+        st.rerun()
+
+
+# ---------------------------------------------------------
+# Header
+# ---------------------------------------------------------
+
+st.markdown(
+    """
+    <div class="hero">
+        <div class="hero-kicker">SMARTVISION INTELLIGENCE SUITE</div>
+        <div class="hero-title">Security Operations Dashboard</div>
+        <div class="hero-subtitle">
+            Monitor video sources, inspect model output, review incidents,
+            and analyze recorded detection events in one workspace.
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------------------------------------------------
+# Overview
+# ---------------------------------------------------------
+
+if page == "Overview":
+    incidents = st.session_state.incidents
+    high_count = sum(x["Severity"] == "High" for x in incidents)
+    review_count = sum(x["Severity"] == "Review" for x in incidents)
+
+    cols = st.columns(4)
+    metrics = [
+        ("INCIDENT RECORDS", len(incidents), "Current session"),
+        ("HIGH-PRIORITY", high_count, "Requires review"),
+        ("REVIEW ITEMS", review_count, "Inspect detections"),
+        ("FRAMES PROCESSED", st.session_state.processed_frames, "This session"),
+    ]
+
+    for col, (label, value, note) in zip(cols, metrics):
+        with col:
+            st.markdown(
+                f"""
+                <div class="metric-card">
+                    <div class="metric-label">{label}</div>
+                    <div class="metric-value">{value:,}</div>
+                    <div class="metric-note">{note}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    st.write("")
+    left, right = st.columns([1.55, 1])
+
+    with left:
+        st.markdown("### Recent incident activity")
+        if incidents:
+            st.dataframe(
+                pd.DataFrame(incidents[-10:][::-1]),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info(
+                "No incidents recorded in this session. "
+                "Upload a video or analyze a camera frame to begin."
+            )
+
+    with right:
+        st.markdown("### Detection distribution")
+        if incidents:
+            counts = Counter(item["Class"] for item in incidents)
+            st.bar_chart(pd.Series(counts, name="Events"))
+        else:
+            st.info("Charts appear after detections are recorded.")
+
+    st.markdown("### Quick actions")
+    a, b, c = st.columns(3)
+    with a:
+        if st.button("Open live monitoring", use_container_width=True):
+            st.session_state["requested_page"] = "Live Monitoring"
+            st.info("Select Live Monitoring from the sidebar.")
+    with b:
+        if st.button("Analyze a video", use_container_width=True):
+            st.info("Select Video Upload from the sidebar.")
+    with c:
+        if st.button("Review incidents", use_container_width=True):
+            st.info("Select Incident History from the sidebar.")
+
+
+# ---------------------------------------------------------
+# Live monitoring
+# ---------------------------------------------------------
+
+elif page == "Live Monitoring":
+    st.markdown("### Live camera monitoring")
+    st.caption(
+        "Capture a frame from your camera and run it through the existing "
+        "inference pipeline. This is frame-based monitoring, not a continuous "
+        "browser video stream."
+    )
+
+    source = st.selectbox(
+        "Camera source",
+        ["Browser camera capture", "Upload a frame"],
+    )
+
+    camera_image = None
+
+    if source == "Browser camera capture":
+        camera_image = st.camera_input("Capture a camera frame")
+    else:
+        camera_image = st.file_uploader(
+            "Upload an image frame",
+            type=["jpg", "jpeg", "png"],
+            key="live_image",
+        )
+
+    if camera_image is not None:
+        raw_bytes = np.frombuffer(camera_image.getvalue(), dtype=np.uint8)
+        frame = cv2.imdecode(raw_bytes, cv2.IMREAD_COLOR)
+
+        if frame is None:
+            st.error("The selected image could not be decoded.")
+        else:
+            st.markdown("#### Captured frame")
+            render_frame(frame)
+
+            if st.button("Analyze frame", type="primary"):
+                with st.spinner("Running the existing inference pipeline..."):
+                    result_frame, detections, error = run_existing_inference(
+                        frame
+                    )
+                    st.session_state.processed_frames += 1
+                    st.session_state.last_source = "Camera"
+                    st.session_state.last_frame = result_frame
+
+                    if error:
+                        st.error(f"Inference could not complete: {error}")
+                    else:
+                        add_incidents(detections, "Camera")
+                        st.success("Inference function completed.")
+
+                    st.markdown("#### Analysis result")
+                    render_frame(result_frame)
+
+                    st.metric("Returned detections", len(detections))
+
+                    if detections:
+                        st.dataframe(
+                            pd.DataFrame([
+                                {
+                                    "Class": detection_label(item),
+                                    "Confidence": detection_confidence(item),
+                                }
+                                for item in detections
+                            ]),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    elif not error:
+                        st.info(
+                            "The inference function returned no structured "
+                            "detections. This does not prove that the scene "
+                            "contains no threat."
+                        )
+
+    if st.session_state.model_load_error:
+        st.warning(
+            "Model initialization error: "
+            + st.session_state.model_load_error
+        )
+
+
+# ---------------------------------------------------------
+# Video upload
+# ---------------------------------------------------------
+
+elif page == "Video Upload":
+    st.markdown("### Video analysis")
+    st.caption(
+        "Upload a video to sample frames and pass them to your existing "
+        "inference pipeline."
+    )
+
+    uploaded_video = st.file_uploader(
+        "Choose a video",
+        type=["mp4", "avi", "mov", "mkv"],
+    )
+
+    sample_every = st.slider(
+        "Analyze every Nth frame",
+        min_value=1,
+        max_value=60,
+        value=10,
+        help="Higher values process fewer frames and run faster.",
+    )
+
+    max_frames = st.slider(
+        "Maximum frames to analyze",
+        min_value=10,
+        max_value=500,
+        value=100,
+        step=10,
+    )
+
+    if uploaded_video is not None:
+        st.video(uploaded_video)
+
+        if st.button("Start video analysis", type="primary"):
+            temp_path = None
+            cap = None
+
+            try:
+                import tempfile
+
+                suffix = Path(uploaded_video.name).suffix or ".mp4"
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=suffix
+                ) as temp_file:
+                    temp_file.write(uploaded_video.getvalue())
+                    temp_path = temp_file.name
+
+                cap = cv2.VideoCapture(temp_path)
+
+                if not cap.isOpened():
+                    st.error("Could not open this video file.")
+                else:
+                    total_frames = int(
+                        cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+                    )
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    if not fps or fps <= 0:
+                        fps = 25.0
+
+                    st.write(
+                        f"Video length: {total_frames} frames · "
+                        f"{fps:.1f} FPS"
+                    )
+
+                    progress = st.progress(0)
+                    status = st.empty()
+                    preview = st.empty()
+                    analyzed = 0
+                    frame_index = 0
+
+                    while analyzed < max_frames:
+                        ok, frame = cap.read()
+                        if not ok:
+                            break
+
+                        if frame_index % sample_every == 0:
+                            result_frame, detections, error = (
+                                run_existing_inference(frame)
+                            )
+
+                            analyzed += 1
+                            st.session_state.processed_frames += 1
+                            st.session_state.last_source = uploaded_video.name
+
+                            if error:
+                                status.error(
+                                    "Inference error: " + error
+                                )
+                                break
+
+                            add_incidents(detections, uploaded_video.name)
+
+                            preview.image(
+                                cv2.cvtColor(
+                                    result_frame, cv2.COLOR_BGR2RGB
+                                ),
+                                caption=f"Analyzed frame {frame_index}",
+                                use_container_width=True,
+                            )
+
+                            if total_frames > 0:
+                                progress.progress(
+                                    min(frame_index / total_frames, 1.0)
+                                )
+
+                            status.write(
+                                f"Analyzed {analyzed} frame(s) · "
+                                f"Detections returned: {len(detections)}"
+                            )
+
+                        frame_index += 1
+
+                    progress.progress(1.0)
+                    status.success(
+                        f"Finished. Analyzed {analyzed} sampled frames."
+                    )
+
+            except Exception as exc:
+                logger.exception("Video analysis failed.")
+                st.error(f"Video analysis failed: {exc}")
+
+            finally:
+                if cap is not None:
+                    cap.release()
+
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+
+
+# ---------------------------------------------------------
+# Incident history
+# ---------------------------------------------------------
+
+elif page == "Incident History":
+    st.markdown("### Incident history")
+    st.caption("Records generated during the current Streamlit session.")
+
+    incidents = st.session_state.incidents
+
+    if not incidents:
+        st.info("No incident records yet. Analyze a frame or upload a video.")
+    else:
+        history_df = pd.DataFrame(incidents)
+
+        search = st.text_input("Search class or source")
+        severity_filter = st.multiselect(
+            "Severity",
+            options=sorted(history_df["Severity"].dropna().unique()),
+            default=sorted(history_df["Severity"].dropna().unique()),
+        )
+
+        filtered = history_df[
+            history_df["Severity"].isin(severity_filter)
+        ]
+
+        if search.strip():
+            mask = (
+                filtered["Class"].astype(str).str.contains(
+                    search, case=False, na=False
+                )
+                | filtered["Source"].astype(str).str.contains(
+                    search, case=False, na=False
+                )
+            )
+            filtered = filtered[mask]
+
+        st.dataframe(
+            filtered.iloc[::-1],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "Export incident history as CSV",
+            data=filtered.to_csv(index=False).encode("utf-8"),
+            file_name="smartvision_incident_history.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+        if st.button("Clear session incident history"):
+            st.session_state.incidents = []
+            st.rerun()
+
+
+# ---------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------
+
+elif page == "Analytics":
+    st.markdown("### Detection analytics")
+
+    incidents = st.session_state.incidents
+
+    if not incidents:
+        st.info(
+            "Analytics will populate when the inference pipeline returns "
+            "structured detections that pass your display filters."
+        )
+    else:
+        df = pd.DataFrame(incidents)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Incident records", len(df))
+        c2.metric("Unique classes", df["Class"].nunique())
+        c3.metric("Sources", df["Source"].nunique())
+
+        left, right = st.columns(2)
+
+        with left:
+            st.markdown("#### Events by class")
+            st.bar_chart(df["Class"].value_counts())
+
+        with right:
+            st.markdown("#### Events by severity")
+            st.bar_chart(df["Severity"].value_counts())
+
+        if df["Confidence"].notna().any():
+            st.markdown("#### Confidence distribution")
+            st.line_chart(
+                df["Confidence"].dropna().reset_index(drop=True)
+            )
+
+        st.markdown("#### Events by source")
+        st.bar_chart(df["Source"].value_counts())
+
+
+# ---------------------------------------------------------
+# Detection controls
+# ---------------------------------------------------------
+
+elif page == "Detection Controls":
+    st.markdown("### Detection controls")
+
+    st.caption(
+        "These settings control dashboard filtering. Model thresholds are "
+        "passed to process_frame only if its signature supports them."
+    )
+
+    st.slider(
+        "Minimum confidence for incident records",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.35,
+        step=0.05,
+        key="confidence",
+    )
+
+    st.multiselect(
+        "Classes to include in incident history",
+        options=["Gun / firearm", "Knife", "Other objects"],
+        default=["Gun / firearm", "Knife"],
+        key="selected_classes",
+    )
+
+    st.toggle(
+        "Enable alert notifications in the dashboard",
+        key="alerts_enabled",
+    )
+
+    st.toggle(
+        "Enable monitoring interface",
+        key="monitoring_enabled",
+    )
+
+    st.divider()
+    st.markdown("#### Model status")
+
+    if st.session_state.model_bundle is not None:
+        st.success("The model loader returned successfully.")
+        st.write("Device:", str(st.session_state.model_bundle[2]))
+        st.write(
+            "LSTM model available:",
+            st.session_state.model_bundle[1] is not None,
+        )
+    elif st.session_state.model_load_error:
+        st.error(st.session_state.model_load_error)
+    else:
+        st.info("Models have not been loaded.")
+
+    if st.button("Initialize models now", type="primary"):
+        st.session_state.model_bundle = None
+        st.session_state.model_load_error = None
+        result = load_existing_models()
+
+        if result is None:
+            st.error(
+                st.session_state.model_load_error
+                or "Model loading did not succeed."
+            )
+        else:
+            st.success("Model loader completed.")
+            st.rerun()
+
+
+# ---------------------------------------------------------
+# Alerts
+# ---------------------------------------------------------
+
+elif page == "Alerts":
+    st.markdown("### Security alerts")
+
+    if not st.session_state.alerts_enabled:
+        st.warning("Dashboard alert notifications are disabled.")
+    else:
+        st.caption(
+            "This page shows session records requiring review. It does not "
+            "send SMS, email, or external notifications."
+        )
+
+        incidents = st.session_state.incidents
+        urgent = [
+            item for item in incidents
+            if item["Severity"] == "High"
+        ]
+        review = [
+            item for item in incidents
+            if item["Severity"] == "Review"
+        ]
+
+        a, b = st.columns(2)
+        a.metric("High-priority records", len(urgent))
+        b.metric("Review records", len(review))
+
+        if urgent:
+            st.markdown("#### High-priority records")
+            st.dataframe(
+                pd.DataFrame(urgent[::-1]),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.success("No high-priority records have been recorded.")
+
+        if review:
+            st.markdown("#### Items to review")
+            st.dataframe(
+                pd.DataFrame(review[::-1]),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.download_button(
+            "Export all alerts",
+            data=pd.DataFrame(incidents).to_csv(index=False).encode("utf-8")
+            if incidents else b"Time,Class,Confidence,Severity,Source\n",
+            file_name="smartvision_alerts.csv",
+            mime="text/csv",
+        )
+
+
+# ---------------------------------------------------------
+# Footer
+# ---------------------------------------------------------
+
+st.divider()
+st.caption(
+    "SmartVision Pro · Local dashboard · "
+    f"Last refreshed {datetime.now().strftime('%H:%M:%S')} · "
+    "Detection results require human verification."
+)
