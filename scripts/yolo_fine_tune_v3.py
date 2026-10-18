@@ -1,100 +1,129 @@
-import sys
-import os
-import time
-import datetime
+@'
+from pathlib import Path
+import json
 import torch
 from ultralytics import YOLO
-from roboflow import Roboflow
+import yaml
 
+ROOT = Path(__file__).resolve().parent.parent
+DATA = ROOT / "The_final-4" / "data.yaml"
+BASE_MODEL = ROOT / "yolo11s.pt"
+OUTPUT_DIR = ROOT / "runs" / "detect"
+RUN_NAME = "smartvision_cpu_retrain"
+
+EXPECTED_CLASSES = [
+    "atm", "backpack", "gun", "handbag", "knife", "person"
+]
 
 def main():
-    # --- 1. SETUP & HARDWARE CHECK ---
-    print("=" * 60)
-    print(
-        f" STARTED TRAINING AT: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-    print("=" * 60)
+    if not DATA.is_file():
+        raise FileNotFoundError(f"Dataset YAML not found: {DATA}")
 
-    print("\n Checking Hardware...")
-    device = "cpu"
-    if torch.cuda.is_available():
-        gpu_count = torch.cuda.device_count()
-        gpu_name = torch.cuda.get_device_name(0)
-        print(f" SUCCESS: Found {gpu_count} GPU(s).")
-        print(f"   Using: {gpu_name}")
-        device = 0
+    if not BASE_MODEL.is_file():
+        raise FileNotFoundError(f"Base YOLO model not found: {BASE_MODEL}")
+
+    with DATA.open("r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    names = config.get("names", {})
+    if isinstance(names, dict):
+        names = [names[k] for k in sorted(names, key=lambda x: int(x))]
     else:
-        print(" WARNING: No GPU detected! Training will be painfully slow.")
+        names = list(names)
 
-    # --- 2. DOWNLOAD DATASET ---
-    print("\n Downloading Dataset from Roboflow...")
+    if [str(x).lower() for x in names] != EXPECTED_CLASSES:
+        raise ValueError(
+            f"Dataset classes do not match expected classes.\n"
+            f"Found: {names}\nExpected: {EXPECTED_CLASSES}"
+        )
 
-    rf = Roboflow(api_key="API_KEY")
-    project = rf.workspace("v2-nfgdu").project("the_final")
-    version = project.version(4)
-    dataset = version.download("yolov11")
+    dataset_root = Path(config.get("path", DATA.parent))
+    if not dataset_root.is_absolute():
+        dataset_root = (DATA.parent / dataset_root).resolve()
 
-    data_yaml_path = os.path.join(dataset.location, "data.yaml")
-    print(f" Dataset ready at: {data_yaml_path}")
+    for split in ("train", "val"):
+        split_path = Path(config[split])
+        if not split_path.is_absolute():
+            split_path = dataset_root / split_path
+        if not split_path.exists():
+            raise FileNotFoundError(
+                f"{split} dataset path does not exist: {split_path}"
+            )
 
-    # --- 3. INITIALIZE MODEL ---
-    print("\nLoad YOLOv11s...")
-    model = YOLO("yolo11s.pt")
+    print("Device: CPU")
+    print(f"Dataset: {DATA}")
+    print(f"Starting weights: {BASE_MODEL}")
+    print("Classes:", ", ".join(EXPECTED_CLASSES))
+    print("Training is starting. CPU training may take many hours.")
 
-    # --- 4. START TRAINING ---
-    print("\n Starting Training (Production Config)...")
-    print(
-        "   Note: Logs are automatically saved to 'runs/detect/production_run_v2/results.csv'"
-    )
-    print("=" * 60)
+    model = YOLO(str(BASE_MODEL))
 
-    start_time = time.time()
-
-    # Training Loop
-    results = model.train(
-        data=data_yaml_path,
-        # --- DURATION ---
-        epochs=100,  # Increased to 100 for the larger dataset
-        patience=0,  # Early stopping if no improvement (saves time)
-        # --- BATCHING ---
-        imgsz=640,
-        batch=64,  # 32 is safer for SGD stability. Use 64 if you have a 4090/A100.
-        device=device,
-        workers=12,
-        # --- OPTIMIZATION (The Generalization Fix) ---
-        optimizer="SGD",  # SGD generalizes better than Adam for detected 'Persons'
-        lr0=0.01,  # Standard initial learning rate
-        cos_lr=True,  # Cosine decay for smooth convergence
-        # --- AUGMENTATIONS (The Webcam Fix) ---
-        mosaic=1.0,  # Maximize context learning
-        mixup=0.1,  # Slight blending to handle motion blur
-        hsv_h=0.015,  # Color hue
-        hsv_s=0.7,  # High Saturation (Fixes webcam lighting issues)
-        hsv_v=0.4,  # High Brightness (Fixes dark room issues)
-        degrees=10.0,
-        translate=0.1,
-        scale=0.5,
-        fliplr=0.5,
-        # --- FINE TUNING ---
-        close_mosaic=10,  # Turn off Mosaic for the last 10 epochs for precision
-        # --- OUTPUT ---
-        project="SmartVision_Final",
-        name="production_v3_balanced_SGD",
+    model.train(
+        data=str(DATA),
+        epochs=20,
+        imgsz=416,
+        batch=4,
+        workers=2,
+        device="cpu",
+        pretrained=True,
+        optimizer="AdamW",
+        patience=5,
+        close_mosaic=5,
         cache=False,
+        amp=False,
+        plots=True,
+        seed=42,
+        project=str(OUTPUT_DIR),
+        name=RUN_NAME,
+        exist_ok=True,
+        save=True,
+        save_period=5,
+        verbose=True,
     )
 
-    # --- 5. TIME CALCULATION ---
-    end_time = time.time()
-    duration = end_time - start_time
-    hours = int(duration // 3600)
-    minutes = int((duration % 3600) // 60)
+    best_weights = OUTPUT_DIR / RUN_NAME / "weights" / "best.pt"
+    if not best_weights.is_file():
+        raise FileNotFoundError(
+            f"Training finished without best.pt at {best_weights}"
+        )
 
-    print("=" * 60)
-    print(f" Training Complete.")
-    print(f" Total Time Taken: {hours} hours, {minutes} minutes.")
-    print(f" Results saved to: {results.save_dir}")
-    print(f" CSV Metrics: {os.path.join(results.save_dir, 'results.csv')}")
+    print(f"\nTraining checkpoint: {best_weights}")
+    print("\nRunning validation on the trained checkpoint...")
 
+    trained_model = YOLO(str(best_weights))
+    metrics = trained_model.val(
+        data=str(DATA),
+        imgsz=416,
+        batch=4,
+        device="cpu",
+        workers=2,
+        plots=True,
+        project=str(OUTPUT_DIR),
+        name=f"{RUN_NAME}_validation",
+        exist_ok=True,
+    )
+
+    results = {
+        str(key): float(value)
+        for key, value in metrics.results_dict.items()
+    }
+
+    report_path = OUTPUT_DIR / RUN_NAME / "validation_metrics.json"
+    report_path.write_text(
+        json.dumps(results, indent=2),
+        encoding="utf-8",
+    )
+
+    print("\nVALIDATION METRICS")
+    print(json.dumps(results, indent=2))
+    print(f"\nMetrics saved to: {report_path}")
+    print(f"Candidate weights: {best_weights}")
+    print(
+        "\nIMPORTANT: This is a candidate model, not an approved "
+        "production detector. Keep threat alerts disabled until "
+        "independent validation and alert-endpoint checks pass."
+    )
 
 if __name__ == "__main__":
     main()
+'@ | Set-Content -Encoding UTF8 ".\scripts\train_smartvision_cpu.py"
