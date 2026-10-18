@@ -1,11 +1,16 @@
 import os
 import sys
+from dotenv import load_dotenv
 
 # --- PROJECT SETUP ---
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(ROOT_DIR, ".env"))
 
 # --- PATHS ---
-YOLO_MODEL_PATH = os.path.join(ROOT_DIR, "models", "yolo11s_fine_tune_v3.pt")
+YOLO_MODEL_PATH = os.getenv(
+    "SMARTVISION_YOLO_MODEL_PATH",
+    os.path.join(ROOT_DIR, "models", "yolo11s_fine_tune_v3.pt"),
+)
 LSTM_MODEL_PATH = os.path.join(ROOT_DIR, "models", "lstm_action_recognition_pro_v2.pth")
 POSE_MODEL_PATH = os.getenv(
     "SMARTVISION_POSE_MODEL_PATH",
@@ -46,7 +51,7 @@ WEBCAM_ID = 0
 CONFIDENCE_THRESHOLD = float(
     os.getenv("SMARTVISION_CONFIDENCE_THRESHOLD", "0.10")
 )
-YOLO_IMAGE_SIZE = int(os.getenv("SMARTVISION_YOLO_IMAGE_SIZE", "416"))
+YOLO_IMAGE_SIZE = int(os.getenv("SMARTVISION_YOLO_IMAGE_SIZE", "320"))
 YOLO_IOU_THRESHOLD = float(os.getenv("SMARTVISION_YOLO_IOU", "0.70"))
 EXPECTED_DETECTOR_CLASSES = (
     "atm",

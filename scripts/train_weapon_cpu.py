@@ -78,6 +78,15 @@ def main():
     if not BASE_MODEL.is_file():
         raise FileNotFoundError(f"Base model missing: {BASE_MODEL}")
 
+    existing_outputs = [
+        path for path in (MODEL_DEST, VALIDATION_DEST) if path.exists()
+    ]
+    if existing_outputs:
+        raise FileExistsError(
+            "Refusing to overwrite existing detector artifacts: "
+            + ", ".join(str(path) for path in existing_outputs)
+        )
+
     with DATA_YAML.open("r", encoding="utf-8-sig") as f:
         cfg = yaml.safe_load(f)
 

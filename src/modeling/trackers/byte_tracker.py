@@ -3,6 +3,7 @@ import math
 
 import supervision as sv
 import numpy as np
+from trackers import ByteTrackTracker as SupervisionByteTrack
 
 logger = logging.getLogger(__name__)
 
@@ -16,24 +17,24 @@ class ByteTracker:
     def __init__(self):
         self.lost_track_buffer = 60
         self.frame_rate = 30.0
+        self._last_timestamp = None
         self.reset()
 
     def reset(self):
         """Start a clean tracker for a new source while preserving its cadence."""
-        self.tracker = sv.ByteTrack(
-            track_activation_threshold=0.25,
+        self.tracker = SupervisionByteTrack(
             lost_track_buffer=self.lost_track_buffer,
-            minimum_matching_threshold=0.8,
-            frame_rate=max(1, int(round(self.frame_rate))),
+            frame_rate=30.0,
+            track_activation_threshold=0.25,
+            minimum_consecutive_frames=1,
+            minimum_iou_threshold=0.8,
+            high_conf_det_threshold=0.25,
         )
-        self._apply_lost_window()
+        self._last_timestamp = None
 
-    def _apply_lost_window(self):
-        cadence = min(max(self.frame_rate, 1.0), 30.0)
-        self.tracker.max_time_lost = max(
-            1,
-            int(cadence / 30.0 * self.lost_track_buffer),
-        )
+    @property
+    def max_time_lost(self):
+        return max(1, math.ceil(self.frame_rate / 30.0 * self.lost_track_buffer))
 
     @staticmethod
     def _box_iou(first, second):
@@ -93,9 +94,8 @@ class ByteTracker:
         if not math.isfinite(frame_rate):
             frame_rate = 1.0
         self.frame_rate = min(max(frame_rate, 1.0), 30.0)
-        self._apply_lost_window()
 
-    def update(self, detections_list):
+    def update(self, detections_list, timestamp=None):
         """
         Input:
             detections_list = list of tuples: ([x1, y1, x2, y2], conf, class_id)
@@ -122,7 +122,19 @@ class ByteTracker:
             xyxy=xyxy, confidence=confidence, class_id=class_id.astype(int)
         )
 
-        tracked_detections = self.tracker.update_with_detections(detections)
+        if timestamp is None:
+            timestamp = (
+                1.0 / self.frame_rate
+                if self._last_timestamp is None
+                else self._last_timestamp + 1.0 / self.frame_rate
+            )
+        if self._last_timestamp is not None and timestamp <= self._last_timestamp:
+            timestamp = self._last_timestamp + 1.0 / 30.0
+        self._last_timestamp = timestamp
+        tracked_detections = self.tracker.update(
+            detections,
+            timestamp=timestamp,
+        )
         tracker_ids = getattr(tracked_detections, "tracker_id", None)
         if tracker_ids is None:
             return tracked_detections[

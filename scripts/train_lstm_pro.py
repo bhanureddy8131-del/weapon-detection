@@ -54,6 +54,12 @@ class ActionDataset(Dataset):
 def train_model():
     print(" Starting Professional Training Pipeline...")
 
+    if MODEL_SAVE_PATH.exists():
+        raise FileExistsError(
+            "Refusing to overwrite the existing LSTM checkpoint: "
+            f"{MODEL_SAVE_PATH}"
+        )
+
     if not DATA_PATH.is_dir():
         raise FileNotFoundError(
             f"Action training data is missing: {DATA_PATH}. "

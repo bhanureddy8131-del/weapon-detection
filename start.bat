@@ -13,7 +13,7 @@ if not exist "%PYTHON_EXE%" (
 )
 
 echo Starting Backend Server on http://localhost:8000 ...
-start "SmartVision Server" "%PYTHON_EXE%" -m uvicorn server.main:app --host 0.0.0.0 --port 8000
+start "SmartVision Server" "%PYTHON_EXE%" -m uvicorn server.main:app --host 127.0.0.1 --port 8000
 
 ping 127.0.0.1 -n 4 >nul
 

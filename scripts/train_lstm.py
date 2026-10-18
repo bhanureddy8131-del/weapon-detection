@@ -53,6 +53,12 @@ class LSTMModel(nn.Module):
 # --- 3. TRAINING FUNCTION ---
 def train_model():
     print(" Loading Data & Balancing Classes...")
+
+    if os.path.exists(MODEL_SAVE_PATH):
+        raise FileExistsError(
+            f"Refusing to overwrite the existing legacy LSTM checkpoint: "
+            f"{MODEL_SAVE_PATH}"
+        )
     
     features = []
     labels = []

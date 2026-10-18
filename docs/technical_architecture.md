@@ -15,12 +15,14 @@ The pipeline processes video frames sequentially through five main stages:
 
 ## 1. Object Detection (YOLOv11)
 
-*   **Model**: Custom fine-tuned YOLOv11s (`yolo11s_fine_tune_v3.pt`).
+*   **Model**: The configured custom six-class checkpoint is `models/yolo11s_fine_tune_v3.pt`. If it is unavailable, the loader uses the root `yolo11s.pt` general-purpose COCO checkpoint. The current workspace has the COCO fallback only; it cannot detect the project's `gun` or `atm` classes, and generic COCO `knife` is not treated as the project's validated knife class.
 *   **Input**: Raw BGR Frame (Resolution Varies).
 *   **Output**: Bounding boxes `[x1, y1, x2, y2]`, Confidence Score `conf`, Class ID `cls`.
 *   **Configuration**:
-    *   `CONFIDENCE_THRESHOLD`: **0.45** (Configurable in `src/config.py`).
-    *   **Classes**:
+    *   `CONFIDENCE_THRESHOLD`: **0.10** by default (`SMARTVISION_CONFIDENCE_THRESHOLD` can override it). Per-class thresholds may raise the effective minimum; the dashboard cannot lower it below the configured global minimum.
+    *   `SMARTVISION_YOLO_MODEL_PATH`: optional trained checkpoint override. The missing configured checkpoint is reported; a generic fallback is not described as a weapon detector.
+    *   `YOLO_IMAGE_SIZE`: **416** by default. The NMS IoU threshold defaults to **0.70**.
+    *   **Custom checkpoint classes** (only when those weights are installed):
         *   `0`: ATM
         *   `1`: Backpack
         *   `2`: Gun
@@ -30,20 +32,21 @@ The pipeline processes video frames sequentially through five main stages:
 
 ### Calculations
 *   **Non-Maximum Suppression (NMS)**: Performed internally by YOLO to remove duplicate boxes.
-*   **Filtering**: Only objects with `conf >= 0.45` are passed to downstream stages.
+*   **Filtering**: Detections must meet the configured global and per-class confidence thresholds. Class names from the loaded weights are mapped explicitly; unrelated COCO classes are not promoted to project threat classes.
 
 ---
 
 ## 2. Object Tracking (ByteTrack)
 
-*   **Library**: `supervision.ByteTrack`.
+*   **Library**: `trackers.ByteTrackTracker`, using `supervision.Detections` as its input/output contract.
 *   **Input**: List of Person Detections `([x1, y1, x2, y2], conf, class_id=5)`.
 *   **Output**: Unique `track_id` for each person across frames.
 
 ### Parameters & Calculations
-*   **Track Activation Threshold**: **0.25**. Detections below this confidence can still be associated with existing tracks but won't start new ones.
-*   **Lost Track Buffer**: **60 Frames**. If a person is occluded, their ID is preserved for ~2 seconds (at 30 FPS) before being discarded.
-*   **Matching Threshold**: **0.8**. Controls how strictly detections must overlap (IoU) with predicted track locations.
+*   **Track Activation Threshold**: **0.25**. Low-confidence detections can associate to existing tracks but do not start new tracks.
+*   **Lost Track Buffer**: **60 frames at a 30 FPS reference rate**, equivalent to a two-second lost-track budget. Capture timestamps are passed to the tracker so skipped frames and irregular timing advance track state by elapsed time.
+*   **Minimum IoU Similarity**: **0.8**. Controls how strictly detections must overlap predicted track locations.
+*   **Track IDs**: A detection may be returned without a confirmed ID on its first observation; the ID is assigned after a consecutive match. Invalid and duplicate IDs are filtered before pose/action history is updated.
 *   **Kalman Filter**: Used internally to predict the next position of a track based on velocity.
 
 ---
@@ -59,8 +62,8 @@ The pipeline processes video frames sequentially through five main stages:
     *   `x, y`: Normalized coordinates [0.0, 1.0].
     *   `z`: Approximate depth.
     *   `visibility`: Confidence score [0.0, 1.0].
-*   **Feature Vector**: Flattened array of size **132** (`33 landmarks * 4 values`).
-    *   If no pose is detected, a zero-vector `[0.0] * 132` is used to maintain sequence continuity.
+*   **Feature Vector**: Flattened `float32` array of size **132** (`33 landmarks * 4 values`).
+    *   A missing or invalid pose clears that person's partial sequence. No action prediction is made until 30 consecutive valid pose frames have been collected.
 
 ---
 
@@ -81,9 +84,18 @@ The pipeline processes video frames sequentially through five main stages:
 ### Calculations
 *   **Sliding Window**: A `deque` (`maxlen=30`) maintains the history for each `track_id`. Newest frame is appended; oldest is dropped.
 *   **Softmax**: Applied to model output logits to get probabilities.
-*   **Confidence Threshold**: `ACTION_CONFIDENCE_THRESHOLD = 0.70`.
-    *   If `max(probs) > 0.70`, the action is accepted.
-    *   Otherwise, defaults to `normal` or retains previous valid state (implementation dependent).
+*   **Confidence Threshold**: `ACTION_CONFIDENCE_THRESHOLD = 0.85` by default.
+    *   An action is accepted when its maximum softmax probability meets the configured threshold.
+    *   Below threshold, no action prediction is emitted; threat rules use `normal` for that frame. This is also the behavior while a valid sequence is still being collected.
+*   **Checkpoint contract**: The loader requires a compatible bidirectional architecture, the configured sequence and feature layout, strict tensor shapes, and exactly the `normal`, `fighting`, and `shooting` class map. Action recognition remains unavailable when the configured checkpoint is missing or incompatible.
+
+## 6. Incident Storage and Notification Delivery
+
+The client derives an idempotency key from source, track ID, event type, class, and the configured cooldown window. It reuses the same key for every retry of a queued incident. FastAPI checks the optional key stored in `IncidentData` before writing an image or database row; a duplicate returns the existing incident and does not enqueue notifications again. The client worker always queues validated rule incidents for API storage even when external notifications are disabled. A success response must include a persisted incident ID; invalid or failed responses remain visible as failed in the session delivery view.
+
+FastAPI stores incidents in the project-root `data/incidents.db` SQLite file by default. Both the API and dashboard use this absolute database path regardless of launch working directory; `SMARTVISION_DATABASE_PATH` can override it. Each incident stores its event time, detected class, confidence, tracking ID, detector notification authorization, and ntfy status/error. Existing databases are migrated on startup.
+
+ntfy is opt-in (`SMARTVISION_ALERTS_ENABLED=false` by default) and additionally requires a topic, validated and operator-approved custom detector weights, and the verified-endpoint gate. The API applies its threat-rule validation before creating an incident and sends ntfy only for authorized non-safe incidents. It commits the row before scheduling delivery. ntfy uses a bounded request timeout; its topic is omitted from logs and errors. Only a successful 2xx response is recorded as `sent`; failures update the incident without deleting it. The safe notification test endpoint does not create an incident.
 
 ---
 

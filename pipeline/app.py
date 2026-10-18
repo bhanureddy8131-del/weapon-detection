@@ -10,9 +10,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# --------------------------------------------------
-# PROJECT PATHS AND IMPORTS
-# --------------------------------------------------
+# ============================================================
+# SMARTVISION PRO - PROJECT SETUP
+# ============================================================
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -28,21 +28,18 @@ from src.config import (
     YOLO_IMAGE_SIZE,
 )
 
-try:
-    from pipeline.run_inference import (
-        get_canonical_class_id,
-        load_models,
-    )
-except ImportError:
-    from run_inference import get_canonical_class_id, load_models
-
+from pipeline.run_inference import (
+    get_canonical_class_id,
+    load_models,
+)
 from pipeline.inference_worker import InferenceWorker
 from pipeline.latest_frame_capture import LatestFrameCapture
 
+API_URL = f"{API_BASE_URL}/incidents"
+HEALTH_URL = f"{API_BASE_URL}/health"
+TEST_NOTIFICATION_URL = f"{API_BASE_URL}/notifications/test"
 
-# --------------------------------------------------
-# STREAMLIT CONFIGURATION
-# --------------------------------------------------
+IMAGE_SIZE_OPTIONS = [320, 416, 512, 640, 768, 960, 1280]
 
 st.set_page_config(
     page_title="SmartVision Pro",
@@ -51,19 +48,24 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-API_URL = f"{API_BASE_URL}/incidents"
 
+# ============================================================
+# BACKEND HEALTH MONITOR
+# ============================================================
 
 class APIHealthMonitor:
-    """Probe the backend outside Streamlit's UI and inference threads."""
+    """Check backend health in a background thread."""
 
-    def __init__(self, url, interval_seconds=5.0):
-        self.url = url
+    def __init__(self, interval_seconds=5.0):
         self.interval_seconds = interval_seconds
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._status = {
             "healthy": None,
+            "database_status": "checking",
+            "database_error": None,
+            "notification_status": "unknown",
+            "notification_error": None,
             "latency_ms": None,
             "error": None,
             "checked_at": None,
@@ -77,27 +79,52 @@ class APIHealthMonitor:
 
     def _run(self):
         while not self._stop_event.is_set():
-            started_at = time.perf_counter()
+            started = time.perf_counter()
+
             try:
                 response = requests.get(
-                    self.url,
-                    params={"limit": 1},
-                    timeout=(0.5, 1.0),
+                    HEALTH_URL,
+                    timeout=(0.5, 2.0),
                 )
                 response.raise_for_status()
-                healthy = True
+                data = response.json()
+
+                if not isinstance(data, dict):
+                    raise ValueError("Invalid backend health response.")
+
+                status = data.get("status") == "running"
+                database_status = data.get(
+                    "database_status", "unknown"
+                )
+                database_error = data.get("database_error")
+                notification_status = data.get(
+                    "notification_status", "unknown"
+                )
+                notification_error = data.get("notification_error")
                 error = None
-            except requests.RequestException as exc:
-                healthy = False
+
+            except (requests.RequestException, ValueError) as exc:
+                status = False
+                database_status = "unavailable"
+                database_error = None
+                notification_status = "unknown"
+                notification_error = None
                 error = str(exc)
 
             with self._lock:
                 self._status = {
-                    "healthy": healthy,
-                    "latency_ms": (time.perf_counter() - started_at) * 1000,
+                    "healthy": status,
+                    "database_status": database_status,
+                    "database_error": database_error,
+                    "notification_status": notification_status,
+                    "notification_error": notification_error,
+                    "latency_ms": (
+                        time.perf_counter() - started
+                    ) * 1000,
                     "error": error,
                     "checked_at": datetime.now(),
                 }
+
             self._stop_event.wait(self.interval_seconds)
 
     def snapshot(self):
@@ -107,42 +134,21 @@ class APIHealthMonitor:
 
 @st.cache_resource
 def get_api_health_monitor():
-    return APIHealthMonitor(API_URL)
+    return APIHealthMonitor()
 
 
 @st.cache_resource
 def get_webcam_lock():
-    """Allow only one Streamlit session per process to own the webcam."""
     return threading.Lock()
 
 
-def stop_active_source():
-    worker = st.session_state.get("smartvision_worker")
-    capture = st.session_state.get("smartvision_capture")
-
-    worker_stopped = worker is None or worker.stop()
-    capture_stopped = capture is None or capture.stop()
-    if not worker_stopped or not capture_stopped:
-        return False
-
-    st.session_state.pop("smartvision_worker", None)
-    st.session_state.pop("smartvision_capture", None)
-    st.session_state.pop("smartvision_live_sequence", None)
-    st.session_state.pop("smartvision_last_live_frame", None)
-    st.session_state.pop("smartvision_last_live_at", None)
-
-    if st.session_state.pop("smartvision_webcam_lock_held", False):
-        get_webcam_lock().release()
-    return True
-
-
-# --------------------------------------------------
-# LOAD AND CACHE MODELS
-# --------------------------------------------------
+# ============================================================
+# MODEL INITIALIZATION
+# ============================================================
 
 @st.cache_resource
 def init_models_and_helpers():
-    """Load detection models and reusable inference helpers once."""
+    """Load the models once per Streamlit process."""
 
     detector, lstm_model, device, inv_class_map, threat_manager = (
         load_models()
@@ -161,18 +167,187 @@ def init_models_and_helpers():
     }
 
 
-def _available_class_ids(detector):
+def available_class_ids(detector):
     names = detector.class_names or {}
-    class_ids = names.keys() if isinstance(names, dict) else range(len(names))
+
+    if isinstance(names, dict):
+        raw_ids = names.keys()
+    else:
+        raw_ids = range(len(names))
+
     return {
-        get_canonical_class_id(detector, int(raw_class_id))
-        for raw_class_id in class_ids
+        get_canonical_class_id(detector, int(class_id))
+        for class_id in raw_ids
     }
 
 
-@st.fragment(run_every="100ms")
+# ============================================================
+# SOURCE AND WORKER MANAGEMENT
+# ============================================================
+
+def stop_active_source():
+    worker = st.session_state.get("smartvision_worker")
+    capture = st.session_state.get("smartvision_capture")
+
+    worker_stopped = worker is None or worker.stop()
+    capture_stopped = capture is None or capture.stop()
+
+    if not worker_stopped or not capture_stopped:
+        return False
+
+    st.session_state.pop("smartvision_worker", None)
+    st.session_state.pop("smartvision_capture", None)
+    st.session_state.pop("smartvision_source", None)
+    st.session_state.pop("smartvision_live_sequence", None)
+
+    if st.session_state.pop(
+        "smartvision_webcam_lock_held", False
+    ):
+        get_webcam_lock().release()
+
+    return True
+
+
+def current_image_size():
+    """Return a valid input size without overriding user settings."""
+
+    value = st.session_state.get(
+        "smartvision_image_size",
+        YOLO_IMAGE_SIZE,
+    )
+
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = 320
+
+    if value not in IMAGE_SIZE_OPTIONS:
+        value = 320
+
+    return value
+
+
+def worker_settings(detector):
+    return {
+        "confidence_threshold": st.session_state.get(
+            "smartvision_confidence_threshold",
+            CONFIDENCE_THRESHOLD,
+        ),
+        "image_size": current_image_size(),
+        "class_thresholds": dict(
+            st.session_state.get(
+                "smartvision_class_thresholds",
+                CLASS_CONFIDENCE_THRESHOLDS,
+            )
+        ),
+        "enabled_classes": set(
+            st.session_state.get(
+                "smartvision_enabled_classes",
+                available_class_ids(detector),
+            )
+        ),
+    }
+
+
+def build_recent_detection_table(recent_detections):
+    columns = ["timestamp", "class", "confidence", "track_id"]
+
+    if not isinstance(recent_detections, list):
+        return pd.DataFrame(columns=columns)
+
+    rows = [
+        {key: item.get(key) for key in columns}
+        for item in recent_detections
+        if isinstance(item, dict)
+    ]
+
+    return pd.DataFrame(rows, columns=columns).tail(20)
+
+
+# ============================================================
+# COMMON DASHBOARD HEADER
+# ============================================================
+
+def render_status_header(runtime):
+    health = get_api_health_monitor().snapshot()
+    capture = st.session_state.get("smartvision_capture")
+    detector = runtime.get("detector") if runtime else None
+
+    header = st.columns([2, 1, 1, 1, 1, 1])
+
+    header[0].markdown("## 🛡️ SmartVision Pro")
+
+    camera_running = (
+        capture is not None and capture.is_running
+    )
+    camera_open = (
+        camera_running and getattr(capture, "opened", False)
+    )
+
+    header[1].badge(
+        "Camera connected" if camera_open else (
+            "Camera recovering" if camera_running else "Camera idle"
+        ),
+        color="green" if camera_open else (
+            "orange" if camera_running else "gray"
+        ),
+    )
+
+    if detector is None:
+        detector_text = "Detector unavailable"
+        detector_color = "red"
+    elif getattr(detector, "alerts_enabled", False):
+        detector_text = "Threat model approved"
+        detector_color = "green"
+    elif getattr(detector, "is_custom_model", False):
+        detector_text = "Custom model unvalidated"
+        detector_color = "orange"
+    else:
+        detector_text = "Generic model"
+        detector_color = "orange"
+
+    header[2].badge(detector_text, color=detector_color)
+
+    api_online = health.get("healthy") is True
+    header[3].badge(
+        "API online" if api_online else (
+            "API checking" if health.get("healthy") is None
+            else "API offline"
+        ),
+        color="green" if api_online else (
+            "gray" if health.get("healthy") is None else "red"
+        ),
+    )
+
+    db_status = health.get("database_status", "unknown")
+    header[4].badge(
+        "Storage online" if db_status == "connected" else (
+            "Storage offline" if db_status == "unavailable"
+            else "Storage checking"
+        ),
+        color="green" if db_status == "connected" else (
+            "red" if db_status == "unavailable" else "gray"
+        ),
+    )
+
+    notification_status = health.get(
+        "notification_status", "unknown"
+    )
+    header[5].badge(
+        "Phone alerts ready" if notification_status == "ready"
+        else "Phone alerts off" if notification_status == "disabled"
+        else "Phone alerts unknown",
+        color="green" if notification_status == "ready"
+        else "gray",
+    )
+
+
+# ============================================================
+# LIVE DETECTION PAGE
+# ============================================================
+
+@st.fragment(run_every="200ms")
 def render_live_inference():
-    """Render fresh capture frames while a separate worker performs inference."""
     capture = st.session_state.get("smartvision_capture")
     worker = st.session_state.get("smartvision_worker")
     runtime = init_models_and_helpers()
@@ -180,140 +355,124 @@ def render_live_inference():
     if runtime is None:
         st.error("The detector runtime is unavailable.")
         return
+
     if capture is None or worker is None:
-        st.info("Select a source and start inference.")
+        st.info("Choose a source and press Start.")
         return
 
-    worker.update_settings({
-        "confidence_threshold": st.session_state.get(
-            "smartvision_confidence_threshold",
-            CONFIDENCE_THRESHOLD,
-        ),
-        "image_size": st.session_state.get(
-            "smartvision_image_size",
-            YOLO_IMAGE_SIZE,
-        ),
-        "class_thresholds": st.session_state.get(
-            "smartvision_class_thresholds",
-            CLASS_CONFIDENCE_THRESHOLDS,
-        ),
-        "enabled_classes": st.session_state.get(
-            "smartvision_enabled_classes",
-            _available_class_ids(runtime["detector"]),
-        ),
-    })
+    detector = runtime["detector"]
+
+    # Apply the latest settings without restarting the camera.
+    worker.update_settings(worker_settings(detector))
+
     result = worker.snapshot()
-    state_data = result["state_data"]
-    api_health = get_api_health_monitor().snapshot()
+    state = result.get("state_data", {})
+    health = get_api_health_monitor().snapshot()
     threat_manager = runtime["threat_manager"]
-    delivery_health = threat_manager.get_delivery_health()
-    health_columns = st.columns(6)
-    custom_detector = getattr(runtime["detector"], "is_custom_model", False)
-    detector_validated = getattr(runtime["detector"], "is_validated", False)
-    health_columns[0].badge(
-        "YOLO: validated" if runtime["detector"].alerts_enabled else (
-            "YOLO: review required" if custom_detector and detector_validated else (
-                "YOLO: unvalidated" if custom_detector else "YOLO: generic"
-            )
-        ),
-        color="green" if runtime["detector"].alerts_enabled else "orange",
+    delivery = threat_manager.get_delivery_health()
+
+    # Model and service status.
+    status_cols = st.columns(6)
+
+    status_cols[0].badge(
+        "YOLO: validated" if getattr(
+            detector, "alerts_enabled", False
+        ) else "YOLO: review required",
+        color="green" if getattr(
+            detector, "alerts_enabled", False
+        ) else "orange",
     )
-    lstm_available = runtime["lstm_model"] is not None
-    health_columns[1].badge(
-        "LSTM: ready" if lstm_available else "LSTM: unavailable",
-        color="green" if lstm_available else "red",
+
+    lstm_ready = runtime["lstm_model"] is not None
+    status_cols[1].badge(
+        "LSTM: ready" if lstm_ready else "LSTM: unavailable",
+        color="green" if lstm_ready else "red",
     )
-    pose_estimator = worker.pose_estimator
-    pose_available = (
-        pose_estimator is not None and pose_estimator.available
-    )
-    pose_error = worker.pose_error or (
-        pose_estimator.diagnostic
-        if pose_estimator is not None and not pose_available
-        else None
-    )
-    health_columns[2].badge(
-        "MediaPipe: ready" if pose_available else (
+
+    pose = worker.pose_estimator
+    pose_ready = pose is not None and pose.available
+
+    status_cols[2].badge(
+        "MediaPipe: ready" if pose_ready else (
             "MediaPipe: initializing"
-            if pose_estimator is None and worker.is_running
+            if pose is None and worker.is_running
             else "MediaPipe: unavailable"
         ),
-        color="green" if pose_available else (
-            "orange"
-            if pose_estimator is None and worker.is_running
-            else "red"
-        ),
+        color="green" if pose_ready else "orange",
     )
-    health_columns[3].badge(
-        "ByteTrack: running" if worker.is_running else "ByteTrack: stopped",
+
+    status_cols[3].badge(
+        "ByteTrack: running" if worker.is_running
+        else "ByteTrack: stopped",
         color="green" if worker.is_running else "gray",
     )
-    health_columns[4].badge(
-        "API: online" if api_health["healthy"] is True else (
-            "API: offline" if api_health["healthy"] is False else "API: checking"
+
+    status_cols[4].badge(
+        "API: online" if health["healthy"] is True else (
+            "API: offline" if health["healthy"] is False
+            else "API: checking"
         ),
-        color="green" if api_health["healthy"] is True else (
-            "red" if api_health["healthy"] is False else "gray"
+        color="green" if health["healthy"] is True else (
+            "red" if health["healthy"] is False else "gray"
         ),
     )
-    if not delivery_health["enabled"]:
-        delivery_label, delivery_color = "Alerts: disabled", "orange"
-    elif delivery_health["healthy"] is True:
-        delivery_label, delivery_color = "Delivery: confirmed", "green"
-    elif delivery_health["healthy"] is False:
-        delivery_label, delivery_color = "Delivery: failed", "red"
-    elif delivery_health["queued"]:
-        delivery_label, delivery_color = "Delivery: queued", "orange"
-    else:
-        delivery_label, delivery_color = "Delivery: untested", "gray"
-    health_columns[5].badge(delivery_label, color=delivery_color)
-    if not delivery_health["enabled"]:
+
+    status_cols[5].badge(
+        "Alerts: enabled" if delivery["enabled"]
+        else "Alerts: disabled",
+        color="green" if delivery["enabled"] else "orange",
+    )
+
+    if not delivery["enabled"]:
         st.warning(
             "Threat notifications are disabled. "
-            + str(delivery_health["disabled_reason"])
-        )
-    elif delivery_health["healthy"] is False:
-        st.error(
-            "The latest alert POST failed; no delivery is being reported as "
-            "successful. "
-            + str(delivery_health["last_error"])
-        )
-    if pose_estimator is None:
-        if pose_error:
-            st.warning(
-                "MediaPipe is unavailable; detection and tracking continue. "
-                + pose_error
-            )
-        else:
-            st.info("MediaPipe is initializing in the inference worker.")
-    elif not pose_available:
-        st.warning(
-            "MediaPipe is unavailable; detection and tracking continue. "
-            + pose_estimator.diagnostic
+            + str(delivery.get("disabled_reason"))
         )
 
+    if not lstm_ready:
+        st.info(
+            "Action recognition is unavailable until a compatible "
+            "LSTM checkpoint is installed."
+        )
+
+    if lstm_ready and not pose_ready:
+        pose_error = getattr(pose, "diagnostic", None) if pose else None
+        st.warning(
+            "MediaPipe pose estimation is not ready. "
+            + str(pose_error or "Check the pose model configuration.")
+        )
+
+    # Display the newest webcam frame, not a delayed queued frame.
     live_frame = None
     live_age_ms = None
+
     if capture.is_webcam:
         live_result = capture.read(0, count_drops=False)
+
         if live_result is not None:
             live_frame, sequence, captured_at, _ = live_result
             st.session_state["smartvision_live_sequence"] = sequence
-            live_age_ms = max(0.0, (time.perf_counter() - captured_at) * 1000)
+            live_age_ms = max(
+                0.0,
+                (time.perf_counter() - captured_at) * 1000,
+            )
+
             if live_age_ms > 500:
                 live_frame = None
     else:
-        live_frame = result["last_processed_frame"]
+        live_frame = result.get("last_processed_frame")
+
+    st.subheader("Live camera feed")
 
     if live_frame is not None:
         st.image(
             live_frame,
             channels="BGR",
             width="stretch",
-            alt="Latest webcam frame without delayed detection overlays",
+            alt="Latest live camera frame",
         )
     elif capture.is_webcam:
-        st.warning("Waiting for the camera to publish its first frame.")
+        st.warning("Waiting for a fresh webcam frame.")
     else:
         st.info("Waiting for the first processed video frame.")
 
@@ -322,457 +481,499 @@ def render_live_inference():
     elif capture.error == "Video finished.":
         st.info("Video finished.")
 
-    if capture.is_webcam and live_age_ms is not None and live_age_ms > 500:
+    if result.get("error"):
+        st.error(f"Inference error: {result['error']}")
+
+    # Current inference results.
+    detections = state.get("object_detections", [])
+    people = state.get("person_detections", [])
+    weapons = [
+        item for item in detections
+        if item.get("class_id") in (2, 4)
+        and item.get("is_project_class", False)
+    ]
+
+    st.subheader("Live metrics")
+    metrics = st.columns(5)
+
+    metrics[0].metric(
+        "Detections",
+        len(detections) + len(people),
+        border=True,
+    )
+    metrics[1].metric(
+        "People",
+        state.get("people_detected", 0),
+        border=True,
+    )
+    metrics[2].metric(
+        "Trained weapon detections",
+        len(weapons) if getattr(
+            detector, "weapon_detection_available", False
+        ) else "Unavailable",
+        border=True,
+    )
+    metrics[3].metric(
+        "Inference FPS",
+        f"{result.get('inference_fps', 0.0):.1f}",
+        border=True,
+    )
+    metrics[4].metric(
+        "Inference latency",
+        f"{result.get('frame_latency_ms', 0.0):.0f} ms",
+        border=True,
+    )
+
+    if not getattr(detector, "weapon_detection_available", False):
         st.warning(
-            f"No fresh webcam frame has arrived for {live_age_ms:.0f} ms. "
-            "The stale frame is not displayed."
+            "The active model has not been confirmed to support the "
+            "project's trained gun/knife classes. Do not rely on it "
+            "for real-world security decisions."
         )
-    if result["error"]:
-        st.error(f"Inference failed: {result['error']}")
 
-    metric_columns = st.columns(6)
-    metric_columns[0].metric("Capture FPS", f"{capture.capture_fps:.1f}")
-    metric_columns[1].metric("Inference FPS", f"{result['inference_fps']:.1f}")
-    metric_columns[2].metric(
-        "Inference frame latency",
-        f"{result['frame_latency_ms']:.0f} ms",
+    more_metrics = st.columns(4)
+    more_metrics[0].metric(
+        "Capture FPS",
+        f"{capture.capture_fps:.1f}",
+        border=True,
     )
-    metric_columns[3].metric(
-        "Latest live-frame age",
-        f"{live_age_ms:.0f} ms" if live_age_ms is not None else "Unavailable",
+    more_metrics[1].metric(
+        "Live frame age",
+        f"{live_age_ms:.0f} ms"
+        if live_age_ms is not None else "Unavailable",
+        border=True,
     )
-    metric_columns[4].metric(
-        "Total processing time",
-        f"{result['processing_ms']:.0f} ms",
+    more_metrics[2].metric(
+        "Processing time",
+        f"{result.get('processing_ms', 0.0):.0f} ms",
+        border=True,
     )
-    metric_columns[5].metric("Dropped frames", capture.dropped_frames)
+    more_metrics[3].metric(
+        "Dropped frames",
+        capture.dropped_frames,
+        border=True,
+    )
 
-    if capture.is_webcam and capture.buffer_setting_supported is False:
-        st.caption(
-            "Camera backend rejected the buffer-size hint; the capture worker "
-            "still drains frames continuously."
-        )
+    resolution = result.get("capture_resolution")
+    inference_resolution = result.get("inference_resolution")
+
     st.caption(
-        "The live panel always shows the newest captured frame. Inference uses "
-        "a single latest-frame slot and may intentionally skip frames."
+        f"Capture resolution: {resolution or 'Unavailable'} · "
+        f"Inference resolution: "
+        f"{inference_resolution or 'Unavailable'} · "
+        f"YOLO input setting: {current_image_size()}"
     )
-    stage_timings = result["timings_ms"]
-    if stage_timings:
-        with st.container(border=True):
-            st.markdown("**Measured inference stages (rolling mean / p95)**")
-            timing_summary = result["timing_summary_ms"]
-            timing_items = [
-                (stage, timing_summary[stage])
-                for stage in (
-                    "yolo",
-                    "mediapipe",
-                    "lstm",
-                    "bytetrack",
-                    "postprocess",
-                    "preprocess",
-                    "alert_enqueue",
-                    "total_processing",
+
+    st.caption(
+        "The webcam preview uses the newest captured frame. "
+        "Inference may skip frames to prevent a backlog."
+    )
+
+    # Stage-level timing.
+    timings = result.get("timing_summary_ms", {})
+
+    if timings:
+        st.subheader("Inference performance breakdown")
+
+        stages = [
+            "yolo",
+            "preprocess",
+            "mediapipe",
+            "lstm",
+            "bytetrack",
+            "postprocess",
+            "alert_enqueue",
+            "total_processing",
+        ]
+
+        visible_stages = [
+            stage for stage in stages if stage in timings
+        ]
+
+        for start in range(0, len(visible_stages), 4):
+            stage_cols = st.columns(
+                min(4, len(visible_stages) - start)
+            )
+
+            for column, stage in zip(
+                stage_cols,
+                visible_stages[start:start + 4],
+            ):
+                summary = timings[stage]
+                column.metric(
+                    stage.replace("_", " ").title(),
+                    f"{summary.get('mean', 0.0):.1f} ms",
+                    delta=(
+                        f"p95 {summary.get('p95', 0.0):.1f} ms"
+                    ),
                 )
-                if stage in timing_summary
-            ]
-            for offset in range(0, len(timing_items), 4):
-                stage_columns = st.columns(
-                    min(4, len(timing_items) - offset)
-                )
-                for column, (stage, summary) in zip(
-                    stage_columns,
-                    timing_items[offset:offset + 4],
-                ):
-                    column.metric(
-                        stage.replace("_", " ").title(),
-                        f"{summary['mean']:.1f} ms",
-                        delta=f"p95 {summary['p95']:.1f} ms",
-                    )
-            delivery_health = threat_manager.get_delivery_health()
-            api_value = delivery_health["last_latency_ms"]
-            api_columns = st.columns(3)
-            api_columns[0].metric(
-                "Latest API request",
-                f"{api_value:.1f} ms" if api_value is not None else "Not measured",
-            )
-            prepare_value = delivery_health["prepare_ms"]
-            api_columns[1].metric(
-                "Latest alert preparation",
-                f"{prepare_value:.1f} ms"
-                if prepare_value is not None
-                else "Not measured",
-            )
-            api_columns[2].metric(
-                "Alerts queued",
-                delivery_health["queued"],
-            )
 
-    st.markdown("**Object detections**")
-    objects = state_data.get("object_detections", [])
-    people = state_data.get("person_detections", [])
-    if objects or people:
-        st.caption(f"Inference timestamp: {result['last_processed_time']}")
-        for detection in objects:
-            confidence = detection.get("confidence")
-            description = detection.get("class", "Unknown")
-            if isinstance(confidence, (int, float)):
-                description += f" · {confidence:.1%}"
-            if not detection.get("is_project_class", False):
-                description += " · detector-only class (not project-validated)"
-            track_id = detection.get("track_id")
-            if track_id is not None:
-                description += f" · Track ID {track_id}"
-            st.write(description)
-        for person in people:
-            confidence = person.get("confidence")
-            description = person.get("class", "Person")
-            if isinstance(confidence, (int, float)):
-                description += f" · {confidence:.1%}"
-            track_id = person.get("track_id")
-            if track_id is not None:
-                description += f" · Track ID {track_id}"
-            st.write(description)
+    # Recent detections.
+    st.subheader("Recent detections")
+    recent = build_recent_detection_table(
+        result.get("recent_detections", [])
+    )
+
+    if recent.empty:
+        st.caption("No detections reported yet.")
     else:
-        st.caption("No supported objects detected in the latest inference.")
-
-    st.markdown("**Action-recognition alerts**")
-    action_detections = state_data.get("action_detections", [])
-    if action_detections:
-        for action in action_detections:
-            st.write(
-                f"{action['class']} · {action['confidence']:.1%} · "
-                f"Track ID {action['track_id']}"
-            )
-    elif runtime["lstm_model"] is None:
-        st.warning("Action recognition is unavailable: no valid LSTM checkpoint.")
-    else:
-        st.caption("No non-normal action was classified in the latest sequence.")
-
-    delivery = threat_manager.get_delivery_health()
-    if delivery["last_latency_ms"] is not None:
-        st.caption(
-            "Latest API delivery: "
-            f"{delivery['last_latency_ms']:.0f} ms · "
-            f"{'healthy' if delivery['healthy'] else delivery['last_error']}"
+        st.dataframe(
+            recent,
+            hide_index=True,
+            width="stretch",
         )
-    st.caption(f"Alerts waiting to send: {delivery['queued']}")
+
+    # LSTM action results.
+    st.subheader("Action-recognition results")
+    actions = state.get("action_detections", [])
+
+    if actions:
+        for action in actions:
+            st.write(
+                f"{action.get('class', 'Unknown')} · "
+                f"{action.get('confidence', 0.0):.1%} · "
+                f"Track ID {action.get('track_id', 'Unknown')}"
+            )
+    elif not lstm_ready:
+        st.warning("Action recognition is unavailable.")
+    else:
+        st.caption("No non-normal action reported for the latest sequence.")
+
+    # Session incident history.
+    with st.expander("Incident history and delivery status"):
+        incidents = threat_manager.get_incident_history(limit=10)
+
+        if not incidents:
+            st.caption("No incidents have been raised in this session.")
+
+        for incident in incidents:
+            st.write(
+                f"{incident.get('created_at')} · "
+                f"{incident.get('event_type')} · "
+                f"{incident.get('label')} · "
+                f"{incident.get('confidence', 0.0):.1%} · "
+                f"{incident.get('status')}"
+            )
+
+            if incident.get("snapshot"):
+                st.image(
+                    incident["snapshot"],
+                    caption="Incident snapshot",
+                    width=320,
+                )
+
+            if incident.get("error"):
+                st.caption(incident["error"])
+
+        st.caption(
+            f"Alerts waiting to send: {delivery.get('queued', 0)}"
+        )
 
 
 @st.fragment(run_every="1s")
 def render_inference_snapshot():
     worker = st.session_state.get("smartvision_worker")
+
     if worker is None:
         return
+
     result = worker.snapshot()
+    frame = result.get("last_processed_frame")
+
     st.subheader("Latest annotated inference")
-    if result["last_processed_frame"] is None:
-        st.caption("No inference result is available yet.")
+
+    if frame is None:
+        st.caption("No completed inference frame is available yet.")
         return
-    snapshot_age_ms = max(
-        0.0,
-        (time.perf_counter() - result["last_processed_at"]) * 1000,
-    )
-    st.caption(
-        f"Last completed inference · {snapshot_age_ms:.0f} ms ago. "
-        "The live panel above is fresher; this frame shows the actual "
-        "detection overlays for the completed inference."
-    )
+
+    last_processed_at = result.get("last_processed_at")
+    if last_processed_at:
+        age_ms = max(
+            0.0,
+            (time.perf_counter() - last_processed_at) * 1000,
+        )
+        st.caption(
+            f"Last completed inference: {age_ms:.0f} ms ago."
+        )
+
     st.image(
-        result["last_processed_frame"],
+        frame,
         channels="BGR",
         width="stretch",
-        alt="Latest completed inference with detection boxes and labels",
+        alt="Completed inference frame with detection annotations",
     )
 
 
-@st.fragment(run_every="2s")
-def render_incident_history(runtime):
-    with st.expander("Incident history and alert delivery"):
-        threat_manager = runtime["threat_manager"]
-        delivery = threat_manager.get_delivery_health()
-        incidents = threat_manager.get_incident_history(limit=10)
-        if not incidents:
-            st.caption("No alert events have been raised in this session.")
-        st.caption(
-            "Session-local detections are distinct from incidents persisted by "
-            "FastAPI. A queued event is not considered delivered."
-        )
-        for incident in incidents:
-            st.write(
-                f"{incident['created_at']} · {incident['event_type']} · "
-                f"{incident['label']} · {incident['confidence']:.1%} · "
-                f"{incident['status']} · attempts {incident['attempts']}"
-            )
-            if incident["snapshot"]:
-                st.image(
-                    incident["snapshot"],
-                    caption="Incident snapshot",
-                    width=320,
-                    alt="Incident snapshot",
-                )
-            if incident["error"]:
-                st.caption(incident["error"])
-        if not delivery["enabled"]:
-            st.warning(
-                "Backend notifications are disabled: "
-                + str(delivery["disabled_reason"])
-            )
-
-
-# --------------------------------------------------
-# LIVE DASHBOARD PAGE
-# --------------------------------------------------
+# ============================================================
+# LIVE DETECTION CONTROLS
+# ============================================================
 
 def run_streamlit_inference_page():
-    st.title("SmartVision Pro")
-    st.caption("Live detection and threat monitoring")
-    st.sidebar.title("Detection source")
+    st.title("Live detection")
+    st.caption(
+        "YOLO object detection · ByteTrack tracking · "
+        "LSTM action recognition · MediaPipe pose estimation"
+    )
 
     runtime = init_models_and_helpers()
 
     if runtime is None or runtime.get("detector") is None:
-        st.error(
-            "YOLO model could not be loaded. "
-            "Check your model configuration and file paths."
-        )
+        st.error("YOLO model could not be loaded. Check the model path.")
         return
 
     detector = runtime["detector"]
-    if detector.alerts_enabled:
-        st.sidebar.success("Validated custom detector loaded; alerts enabled.")
-    else:
-        st.sidebar.warning(detector.model_diagnostic)
 
-    available_ids = _available_class_ids(detector)
-    safety_class_labels = [
-        label
-        for class_id, label in (
-            (5, "person"),
-            (2, "firearm"),
-            (4, "knife/blade"),
+    if getattr(detector, "alerts_enabled", False):
+        st.sidebar.success("Validated detector loaded.")
+    else:
+        st.sidebar.warning(
+            getattr(
+                detector,
+                "model_diagnostic",
+                "Detector validation is required.",
+            )
         )
-        if class_id in available_ids
+
+    class_ids = available_class_ids(detector)
+    class_labels = [
+        label for class_id, label in (
+            (5, "Person"),
+            (2, "Firearm"),
+            (4, "Knife/blade"),
+        )
+        if class_id in class_ids
     ]
+
     st.sidebar.caption(
-        "Supported safety classes: "
-        + (", ".join(safety_class_labels) if safety_class_labels else "none")
+        "Available safety classes: "
+        + (", ".join(class_labels) if class_labels else "None")
     )
 
-    if st.sidebar.button("🔄 Reload Model & Settings"):
+    if st.sidebar.button("Reload model and settings"):
         if not stop_active_source():
             st.error(
-                "The active video worker did not stop cleanly. "
-                "The model was not reloaded to avoid duplicate workers."
+                "The worker did not stop cleanly. "
+                "Stop the active source before reloading."
             )
             return
+
         old_runtime = init_models_and_helpers()
-        if old_runtime is not None:
+
+        if old_runtime:
             old_runtime["threat_manager"].close()
+
         init_models_and_helpers.clear()
         st.rerun()
 
     input_option = st.sidebar.selectbox(
-        "Select Input Source",
-        (
+        "Input source",
+        [
             "Live Webcam",
-            "Upload Video",
             "Select from Input Folder",
-        ),
+            "Upload Video",
+        ],
     )
 
     source_path = None
     uploaded_temp_path = None
 
     if input_option == "Live Webcam":
-        source_path = st.session_state.get(
-            "smartvision_camera_index",
-            WEBCAM_ID,
+        source_path = int(
+            st.session_state.get(
+                "smartvision_camera_index",
+                WEBCAM_ID,
+            )
         )
-
-        st.info(
-            "Selected source: Live Webcam. "
-            "Click Start Inference to begin."
-        )
+        st.info("Live webcam selected. Press Start to begin.")
 
     elif input_option == "Select from Input Folder":
         if os.path.isdir(INPUT_VIDEO_DIR):
-            video_files = sorted(
-                filename
-                for filename in os.listdir(INPUT_VIDEO_DIR)
-                if filename.lower().endswith(
+            files = sorted(
+                name for name in os.listdir(INPUT_VIDEO_DIR)
+                if name.lower().endswith(
                     (".mp4", ".avi", ".mov", ".mkv")
                 )
             )
 
-            if video_files:
-                selected_file = st.sidebar.selectbox(
+            if files:
+                selected = st.sidebar.selectbox(
                     "Choose a video",
-                    video_files,
+                    files,
                 )
-
                 source_path = os.path.join(
                     INPUT_VIDEO_DIR,
-                    selected_file,
+                    selected,
                 )
-
-                st.info(f"Selected video: {selected_file}")
+                st.info(f"Selected video: {selected}")
             else:
                 st.warning(
-                    f"No videos found in {INPUT_VIDEO_DIR}"
+                    f"No supported videos found in {INPUT_VIDEO_DIR}"
                 )
         else:
-            st.error(
-                f"Input folder does not exist: {INPUT_VIDEO_DIR}"
-            )
+            st.error(f"Input folder not found: {INPUT_VIDEO_DIR}")
 
     elif input_option == "Upload Video":
-        uploaded_file = st.sidebar.file_uploader(
-            "Upload a video",
+        uploaded = st.sidebar.file_uploader(
+            "Choose a video",
             type=["mp4", "avi", "mov", "mkv"],
         )
 
-        if uploaded_file is not None:
-            suffix = os.path.splitext(uploaded_file.name)[1]
-            signature = (uploaded_file.name, uploaded_file.size)
+        if uploaded is not None:
+            signature = (uploaded.name, uploaded.size)
+            old_path = st.session_state.get(
+                "smartvision_uploaded_temp_path"
+            )
+            old_signature = st.session_state.get(
+                "smartvision_uploaded_signature"
+            )
 
             try:
-                previous_path = st.session_state.get(
-                    "smartvision_uploaded_temp_path"
-                )
-                previous_signature = st.session_state.get(
-                    "smartvision_uploaded_signature"
-                )
                 if (
-                    previous_path
-                    and previous_signature == signature
-                    and os.path.isfile(previous_path)
+                    old_path
+                    and old_signature == signature
+                    and os.path.isfile(old_path)
                 ):
-                    uploaded_temp_path = previous_path
+                    uploaded_temp_path = old_path
                 else:
-                    if previous_path and os.path.isfile(previous_path):
-                        os.remove(previous_path)
+                    if old_path and os.path.isfile(old_path):
+                        os.remove(old_path)
+
+                    suffix = os.path.splitext(uploaded.name)[1]
+
                     with tempfile.NamedTemporaryFile(
                         delete=False,
                         suffix=suffix,
                     ) as temp_file:
-                        temp_file.write(uploaded_file.getbuffer())
+                        temp_file.write(uploaded.getbuffer())
                         uploaded_temp_path = temp_file.name
-                    st.session_state["smartvision_uploaded_signature"] = signature
-                    st.session_state["smartvision_uploaded_temp_path"] = uploaded_temp_path
+
+                    st.session_state[
+                        "smartvision_uploaded_temp_path"
+                    ] = uploaded_temp_path
+                    st.session_state[
+                        "smartvision_uploaded_signature"
+                    ] = signature
 
                 source_path = uploaded_temp_path
-                st.caption("Video upload is ready.")
+                st.success("Video is ready.")
 
             except OSError as exc:
-                st.error(f"Could not save uploaded video: {exc}")
+                st.error(f"Could not save the uploaded video: {exc}")
 
     start_col, stop_col = st.sidebar.columns(2)
-    if start_col.button("Start", type="primary", key="start_smartvision"):
+
+    if start_col.button(
+        "Start",
+        type="primary",
+        key="start_smartvision",
+    ):
         if source_path is None:
-            st.error("Select a valid video source before starting.")
+            st.error("Select a valid video source first.")
+
         else:
-            existing_capture = st.session_state.get("smartvision_capture")
-            existing_worker = st.session_state.get("smartvision_worker")
-            if (
-                existing_capture is not None
-                and existing_worker is not None
-                and existing_capture.source == source_path
-                and existing_capture.is_running
-                and existing_worker.is_running
-            ):
-                st.info("This source is already running in this session.")
+            old_capture = st.session_state.get("smartvision_capture")
+            old_worker = st.session_state.get("smartvision_worker")
+
+            already_running = (
+                old_capture is not None
+                and old_worker is not None
+                and old_capture.source == source_path
+                and old_capture.is_running
+                and old_worker.is_running
+            )
+
+            if already_running:
+                st.info("This source is already running.")
+
             elif not stop_active_source():
                 st.error(
-                    "The previous video worker did not stop cleanly. "
-                    "The source was not reopened."
+                    "The previous worker is still stopping. "
+                    "Wait and press Stop again."
                 )
+
             else:
-                camera_lock = get_webcam_lock()
-                webcam_lock_acquired = False
+                lock = get_webcam_lock()
+                lock_acquired = False
+
                 if isinstance(source_path, int):
-                    webcam_lock_acquired = camera_lock.acquire(
-                        blocking=False
-                    )
-                    if not webcam_lock_acquired:
+                    lock_acquired = lock.acquire(blocking=False)
+
+                    if not lock_acquired:
                         st.error(
-                            "The webcam is already owned by another "
-                            "SmartVision session in this server process."
+                            "The webcam is already in use by another "
+                            "SmartVision session."
                         )
 
-                if isinstance(source_path, int) and not webcam_lock_acquired:
-                    pass
-                else:
-                    if webcam_lock_acquired:
-                        st.session_state["smartvision_webcam_lock_held"] = True
+                if (
+                    not isinstance(source_path, int)
+                    or lock_acquired
+                ):
+                    if lock_acquired:
+                        st.session_state[
+                            "smartvision_webcam_lock_held"
+                        ] = True
 
                     capture = LatestFrameCapture(source_path)
+
                     if capture.wait_until_ready():
-                        st.session_state["smartvision_capture"] = capture
-                        st.session_state["smartvision_source"] = source_path
+                        st.session_state[
+                            "smartvision_capture"
+                        ] = capture
+
                         if capture.is_webcam:
                             source_name = f"camera_{capture.source}"
-                        elif isinstance(capture.source, (str, os.PathLike)):
-                            source_name = os.path.basename(capture.source)
                         else:
-                            source_name = f"source_{capture.source}"
+                            source_name = os.path.basename(
+                                str(capture.source)
+                            )
+
                         try:
                             worker = InferenceWorker(
                                 capture,
                                 runtime,
                                 source_name,
-                                settings={
-                                    "confidence_threshold": st.session_state.get(
-                                        "smartvision_confidence_threshold",
-                                        CONFIDENCE_THRESHOLD,
-                                    ),
-                                    "image_size": st.session_state.get(
-                                        "smartvision_image_size",
-                                        YOLO_IMAGE_SIZE,
-                                    ),
-                                    "class_thresholds": st.session_state.get(
-                                        "smartvision_class_thresholds",
-                                        CLASS_CONFIDENCE_THRESHOLDS,
-                                    ),
-                                    "enabled_classes": st.session_state.get(
-                                        "smartvision_enabled_classes",
-                                        _available_class_ids(detector),
-                                    ),
-                                },
+                                settings=worker_settings(detector),
                             )
+
                         except Exception as exc:
-                            if not stop_active_source():
-                                st.error(
-                                    "Worker initialization failed and capture "
-                                    "shutdown is still pending."
+                            capture.stop()
+
+                            st.session_state.pop(
+                                "smartvision_capture",
+                                None,
+                            )
+
+                            if lock_acquired:
+                                st.session_state.pop(
+                                    "smartvision_webcam_lock_held",
+                                    None,
                                 )
-                            st.error(f"Could not start inference: {exc}")
-                        else:
-                            st.session_state["smartvision_worker"] = worker
-                            st.session_state["smartvision_live_sequence"] = 0
-                            st.session_state.pop(
-                                "smartvision_last_live_frame",
-                                None,
-                            )
-                            st.session_state.pop(
-                                "smartvision_last_live_at",
-                                None,
-                            )
-                    else:
-                        st.error(capture.error or "Could not start video capture.")
-                        capture_stopped = capture.stop()
-                        if not capture_stopped:
-                            st.session_state["smartvision_capture"] = capture
+                                lock.release()
+
                             st.error(
-                                "Camera startup timed out and its capture "
-                                "thread has not stopped; the camera remains "
-                                "reserved until shutdown completes."
+                                f"Could not start inference worker: {exc}"
                             )
-                        elif webcam_lock_acquired:
+
+                        else:
+                            st.session_state[
+                                "smartvision_worker"
+                            ] = worker
+                            st.session_state[
+                                "smartvision_source"
+                            ] = source_path
+
+                    else:
+                        st.error(
+                            capture.error or "Could not open the source."
+                        )
+                        capture.stop()
+
+                        if lock_acquired:
                             st.session_state.pop(
                                 "smartvision_webcam_lock_held",
                                 None,
                             )
-                            camera_lock.release()
+                            lock.release()
 
     if stop_col.button("Stop", key="stop_smartvision"):
         if stop_active_source():
@@ -780,376 +981,107 @@ def run_streamlit_inference_page():
                 "smartvision_uploaded_temp_path",
                 None,
             )
+
             if uploaded_path and os.path.isfile(uploaded_path):
                 try:
                     os.remove(uploaded_path)
                 except OSError as exc:
                     st.warning(
-                        f"The temporary uploaded video could not be removed: {exc}"
+                        f"Temporary file cleanup failed: {exc}"
                     )
-            st.session_state.pop("smartvision_uploaded_signature", None)
+
+            st.session_state.pop(
+                "smartvision_uploaded_signature",
+                None,
+            )
+            st.success("Inference stopped.")
         else:
             st.error(
-                "The video worker did not stop cleanly. The source remains "
-                "reserved; wait briefly and press Stop again."
+                "The source has not stopped completely. "
+                "Wait briefly and press Stop again."
             )
 
     capture = st.session_state.get("smartvision_capture")
+
     if capture is not None:
-        st.subheader("Live detection")
         render_live_inference()
         render_inference_snapshot()
-        render_incident_history(runtime)
     else:
-        st.info("No active source. Choose a camera or video and select Start.")
+        st.info("No active source. Select a source and press Start.")
 
 
-@st.cache_data(ttl=10, max_entries=4, show_spinner=False)
+# ============================================================
+# INCIDENT API HELPERS
+# ============================================================
+
 def fetch_incidents(limit=100):
     try:
         response = requests.get(
             API_URL,
             params={"limit": limit},
-            timeout=10,
+            timeout=(1.0, 5.0),
         )
+
         if response.status_code != 200:
             return [], f"Incident API returned HTTP {response.status_code}."
-        alerts = response.json()
-        if isinstance(alerts, dict):
+
+        data = response.json()
+
+        if isinstance(data, dict):
             for key in ("items", "incidents", "data"):
-                if key in alerts:
-                    alerts = alerts[key]
+                if key in data:
+                    data = data[key]
                     break
             else:
-                return [], "Incident API returned an unexpected response format."
-        if not isinstance(alerts, list):
-            return [], "Incident API returned an unexpected response format."
-        return alerts, None
+                return [], "Unexpected incident API response."
+
+        if not isinstance(data, list):
+            return [], "Unexpected incident API response."
+
+        return data, None
+
     except requests.RequestException as exc:
-        return [], f"Could not connect to the incident API: {exc}"
+        return [], f"Could not connect to FastAPI: {exc}"
     except (ValueError, TypeError) as exc:
         return [], f"Could not read incident response: {exc}"
 
 
-def backend_is_available():
-    return get_api_health_monitor().snapshot()["healthy"] is True
-
-
-def _render_status_header(runtime):
-    capture = st.session_state.get("smartvision_capture")
-    model_ok = runtime is not None and runtime.get("detector") is not None
-    api_health = get_api_health_monitor().snapshot()
-    api_ok = api_health["healthy"] is True
-    camera_ok = capture is not None and capture.is_running
-    camera_open = (
-        capture is not None
-        and camera_ok
-        and capture.opened
-    )
-    header_columns = st.columns([2.2, 1, 1, 1, 1.1, 0.8])
-    header_columns[0].markdown("## SmartVision Pro")
-    header_columns[1].badge(
-        "Camera connected" if camera_open else (
-            "Camera recovering" if camera_ok else "Camera idle"
-        ),
-        color="green" if camera_open else (
-            "orange" if camera_ok else "gray"
-        ),
-    )
-    header_columns[2].badge(
-        "AI model ready" if model_ok else "AI model unavailable",
-        color="green" if model_ok else "red",
-    )
-    if api_health["healthy"] is None:
-        api_label, api_color = "API checking", "gray"
-    else:
-        api_label = "API online" if api_ok else "API offline"
-        api_color = "green" if api_ok else "red"
-    header_columns[3].badge(api_label, color=api_color)
-    header_columns[4].caption(datetime.now().strftime("%H:%M:%S"))
-    light_theme = header_columns[5].toggle(
-        "Light",
-        key="smartvision_light_theme",
-        help="Switch the dashboard appearance.",
-    )
-    if light_theme:
-        st.html(
-            """
-            <style>
-            :root {
-                color-scheme: light;
-                --background-color: #F3F6FB;
-                --secondary-background-color: #E7EDF5;
-                --text-color: #17263B;
-                --primary-color: #2457D6;
-            }
-            [data-testid="stAppViewContainer"] {
-                background-color: #F3F6FB !important;
-            }
-            [data-testid="stSidebar"] {
-                background-color: #E7EDF5 !important;
-            }
-            [data-testid="stMetric"] {
-                background-color: #FFFFFF;
-                border: 1px solid #D4DEEA;
-                border-radius: 6px;
-            }
-            </style>
-            """
+def fetch_incident_summary():
+    try:
+        response = requests.get(
+            f"{API_URL}/summary",
+            timeout=(1.0, 5.0),
         )
+        response.raise_for_status()
+        summary = response.json()
+
+        if not isinstance(summary, dict):
+            raise ValueError("Summary response is not an object.")
+
+        if (
+            type(summary.get("total")) is not int
+            or type(summary.get("today")) is not int
+            or not isinstance(summary.get("by_class"), dict)
+        ):
+            raise ValueError("Summary response has an invalid structure.")
+
+        return summary, None
+
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        return None, f"Could not load incident summary: {exc}"
 
 
-def _render_overview():
-    st.title("Overview")
-    alerts, alert_error = fetch_incidents()
-    capture = st.session_state.get("smartvision_capture")
-    worker = st.session_state.get("smartvision_worker")
-    state = worker.snapshot() if worker is not None else {}
-    active_cameras = int(
-        capture is not None and capture.is_webcam and capture.is_running
-    )
-    latest_state = state.get("state_data", {})
-    weapons = latest_state.get("weapon_detections", [])
-    critical_alerts = sum(
-        "CRITICAL" in str(alert.get("threat_level", "")).upper()
-        for alert in alerts
-    )
-    fps = state.get("inference_fps", 0.0)
-
-    with st.container(horizontal=True):
-        st.metric("Active cameras", active_cameras, border=True)
-        st.metric("People detected", latest_state.get("people_detected", 0), border=True)
-        st.metric("Weapon detections", len(weapons), border=True)
-        st.metric("Critical alerts (latest 100)", critical_alerts, border=True)
-        st.metric("Inference FPS", f"{fps:.1f}", border=True)
-
-    if alert_error:
-        st.warning(alert_error)
-    elif alerts:
-        valid_records = [alert for alert in alerts if isinstance(alert, dict)]
-        valid_alerts = pd.DataFrame(valid_records)
-        if "created_at" in valid_alerts:
-            valid_alerts["created_at"] = pd.to_datetime(
-                valid_alerts["created_at"], errors="coerce", utc=True
-            )
-        left, right = st.columns(2)
-        with left:
-            st.subheader("Alerts by severity")
-            if "threat_level" in valid_alerts:
-                counts = valid_alerts["threat_level"].fillna("Unknown").value_counts()
-                st.bar_chart(counts, horizontal=True)
-        with right:
-            st.subheader("Detections by class")
-            if "label" in valid_alerts:
-                counts = valid_alerts["label"].fillna("Unknown").value_counts()
-                st.bar_chart(counts, horizontal=True)
-        activity_columns = st.columns(2)
-        with activity_columns[0]:
-            st.subheader("Detections over time")
-            if {"created_at", "label"}.issubset(valid_alerts.columns):
-                timed_alerts = valid_alerts.dropna(subset=["created_at"])
-                if not timed_alerts.empty:
-                    hourly = timed_alerts.groupby(
-                        pd.Grouper(key="created_at", freq="h")
-                    ).size()
-                    st.bar_chart(hourly)
-                else:
-                    st.caption("Stored incidents do not include valid timestamps.")
-        with activity_columns[1]:
-            st.subheader("Camera activity")
-            if "camera_id" in valid_alerts:
-                activity = valid_alerts["camera_id"].fillna("Unknown").value_counts()
-                st.bar_chart(activity, horizontal=True)
-    else:
-        st.info("No stored incidents are available for analytics yet.")
-
-    history = list(state.get("performance_history", []))
-    if history:
-        st.subheader("Measured inference performance")
-        performance = pd.DataFrame(history).set_index("time")
-        st.line_chart(performance, y=["fps", "latency_ms"])
-    else:
-        st.caption("Performance history will appear after inference starts.")
-
-
-def _render_camera_management():
-    st.title("Camera management")
-    camera_index = st.number_input(
-        "Webcam device index",
-        min_value=0,
-        max_value=16,
-        value=int(st.session_state.get("smartvision_camera_index", WEBCAM_ID)),
-        step=1,
-        key="smartvision_camera_index",
-    )
-    capture = st.session_state.get("smartvision_capture")
-    with st.container(border=True):
-        st.markdown("**Configured webcam**")
-        st.write(f"Device index: {camera_index}")
-        if capture is not None and capture.is_running:
-            st.success("Capture worker is active.")
-            st.caption(f"Measured capture rate: {capture.capture_fps:.1f} FPS")
-        else:
-            st.info("No camera is currently streaming.")
-    st.caption("Choose this device under Live Detection and select Start to connect.")
-
-
-def _render_detection_settings(runtime):
-    st.title("Detection settings")
-    available_ids = _available_class_ids(runtime["detector"])
-    supported_options = [
-        (5, "Person"),
-        (2, "Firearm"),
-        (4, "Knife or blade"),
-    ]
-    supported_options = [item for item in supported_options if item[0] in available_ids]
-    enabled = st.session_state.get(
-        "smartvision_enabled_classes",
-        available_ids,
-    )
-    enabled = set(enabled)
-    if supported_options:
-        for class_id, label in supported_options:
-            enabled_value = st.checkbox(
-                f"Enable {label.lower()} detection",
-                value=class_id in enabled,
-                key=f"enable_class_{class_id}",
-            )
-            if enabled_value and class_id in available_ids:
-                enabled.add(class_id)
-            else:
-                enabled.discard(class_id)
-        st.session_state["smartvision_enabled_classes"] = enabled
-    else:
-        st.warning("No supported safety classes are present in the loaded model.")
-
-    st.session_state["smartvision_confidence_threshold"] = st.slider(
-        "Minimum detection confidence",
-        min_value=min(0.99, max(0.05, CONFIDENCE_THRESHOLD)),
-        max_value=0.99,
-        value=min(0.99, max(CONFIDENCE_THRESHOLD, float(st.session_state.get(
-            "smartvision_confidence_threshold",
-            CONFIDENCE_THRESHOLD,
-        )))),
-        step=0.05,
-    )
-    for class_id, label in supported_options:
-        class_thresholds = st.session_state.get(
-            "smartvision_class_thresholds",
-            dict(CLASS_CONFIDENCE_THRESHOLDS),
-        )
-        class_thresholds = dict(class_thresholds)
-        class_thresholds[class_id] = st.slider(
-            f"{label} confidence threshold",
-            min_value=0.05,
-            max_value=0.99,
-            value=min(0.99, max(0.05, float(class_thresholds.get(class_id, CONFIDENCE_THRESHOLD)))),
-            step=0.05,
-            key=f"confidence_class_{class_id}",
-        )
-        st.session_state["smartvision_class_thresholds"] = class_thresholds
-
-    st.session_state["smartvision_image_size"] = st.select_slider(
-        "YOLO input size",
-        options=[320, 416, 512, 640, 768, 960, 1280],
-        value=int(st.session_state.get("smartvision_image_size", YOLO_IMAGE_SIZE)),
-    )
-    runtime["threat_manager"].log_cooldown = st.slider(
-        "Alert cooldown per source and event (seconds)",
-        min_value=1,
-        max_value=300,
-        value=int(runtime["threat_manager"].log_cooldown),
-        step=1,
-    )
-    st.caption(
-        "Thresholds can only become stricter than the configured global minimum. "
-        "Unavailable model classes cannot be enabled here."
-    )
-
-
-def _render_system_health(runtime):
-    st.title("Model and system health")
-    if runtime is None or runtime.get("detector") is None:
-        st.error("The detector is unavailable.")
-        return
-    detector = runtime["detector"]
-    device = runtime["device"]
-    st.metric("Inference device", str(device))
-    if detector.alerts_enabled:
-        st.success("Validated custom YOLO weights are loaded; production alerts are enabled.")
-    elif detector.is_custom_model and detector.is_validated:
-        st.warning(
-            "Six-class weights passed the recorded validation checks, but "
-            "production alerts remain disabled until an operator reviews and "
-            "approves the validation record."
-        )
-    elif detector.is_custom_model:
-        st.warning(
-            detector.model_diagnostic
-        )
-    else:
-        st.warning(
-            "A general COCO fallback model is loaded; custom safety weights "
-            "are missing and production alerts are disabled."
-        )
-    st.write("Action recognition:", "Loaded" if runtime["lstm_model"] is not None else "Unavailable")
-    if runtime["lstm_model"] is None:
-        st.info("Fighting and shooting recognition are disabled until a valid LSTM checkpoint is installed.")
-    worker = st.session_state.get("smartvision_worker")
-    pose_estimator = worker.pose_estimator if worker is not None else None
-    if pose_estimator is None:
-        st.write("MediaPipe:", "Not initialized (start a stream to initialize it)")
-    elif pose_estimator.available:
-        st.success(f"MediaPipe: {pose_estimator.diagnostic}")
-    else:
-        st.warning(f"MediaPipe: {pose_estimator.diagnostic}")
-    st.write(
-        "ByteTrack:",
-        "Running" if worker is not None and worker.is_running else "Not running",
-    )
-    api_online = backend_is_available()
-    st.write("Backend API:", "Connected" if api_online else "Unavailable")
-    if not api_online:
-        st.warning(
-            f"Could not reach {API_URL}. Check that the FastAPI service is "
-            "running and SMARTVISION_API_BASE_URL points to it."
-        )
-    delivery = runtime["threat_manager"].get_delivery_health()
-    st.write("Alert queue:", delivery["queued"], "pending")
-    if not delivery["enabled"]:
-        st.warning("Alert delivery disabled: " + str(delivery["disabled_reason"]))
-    elif delivery["healthy"] is True:
-        st.write("Last alert delivery:", "Confirmed by FastAPI")
-    elif delivery["healthy"] is False:
-        st.error("Last alert delivery failed: " + str(delivery["last_error"]))
-    else:
-        st.write("Last alert delivery:", "No delivery attempted")
-    names = detector.class_names or {}
-    st.write("Detector classes:", ", ".join(map(str, names.values() if isinstance(names, dict) else names)))
-
-
-# --------------------------------------------------
-# ALERT HISTORY
-# --------------------------------------------------
-
-def show_alert_history():
-    st.title("Alert history")
-    alerts, error = fetch_incidents(limit=200)
-    if error:
-        st.error(error)
-        st.caption("Confirm the backend is running and the configured API endpoint is reachable.")
-        return
-    if not alerts:
-        st.info("No alerts found.")
-        return
-
+def normalize_incidents(alerts):
     records = []
-    invalid_rows = 0
+    invalid = 0
+
     for alert in alerts:
         if not isinstance(alert, dict):
-            invalid_rows += 1
+            invalid += 1
             continue
+
         row = dict(alert)
+
         try:
             row["confidence"] = (
                 float(row["confidence"])
@@ -1158,129 +1090,702 @@ def show_alert_history():
             )
         except (TypeError, ValueError):
             row["confidence"] = None
-        raw_created_at = row.get("created_at")
-        row["created_at"] = (
-            pd.to_datetime(
-                str(raw_created_at),
+
+        row["created_at"] = pd.to_datetime(
+            row.get("created_at"),
+            errors="coerce",
+            utc=True,
+        )
+
+        row["threat_level"] = str(
+            row.get("threat_level") or "Unknown"
+        )
+        row["label"] = str(row.get("label") or "Unknown")
+        row["detected_class"] = str(
+            row.get("detected_class") or row["label"]
+        )
+        row["camera_id"] = str(
+            row.get("camera_id") or "Unknown"
+        )
+        row["notification_status"] = str(
+            row.get("notification_status") or "unknown"
+        )
+        row["notification_error"] = str(
+            row.get("notification_error") or ""
+        )
+
+        records.append(row)
+
+    return pd.DataFrame(records), invalid
+
+
+def send_test_notification():
+    try:
+        response = requests.post(
+            TEST_NOTIFICATION_URL,
+            timeout=(1.0, 8.0),
+        )
+
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get(
+                    "detail", "Notification test failed."
+                )
+            except (ValueError, AttributeError):
+                detail = "Notification test failed."
+
+            return False, str(detail)
+
+        result = response.json()
+
+        if (
+            not isinstance(result, dict)
+            or result.get("status") != "sent"
+        ):
+            return False, "Backend did not confirm notification delivery."
+
+        return True, result.get(
+            "message", "Test notification accepted."
+        )
+
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        return False, f"Notification test failed: {exc}"
+
+
+# ============================================================
+# OVERVIEW PAGE
+# ============================================================
+
+@st.fragment(run_every="10s")
+def render_overview():
+    st.title("Overview")
+    st.caption("SmartVision Pro system summary")
+
+    summary, summary_error = fetch_incident_summary()
+    capture = st.session_state.get("smartvision_capture")
+    worker = st.session_state.get("smartvision_worker")
+
+    result = worker.snapshot() if worker is not None else {}
+    state = result.get("state_data", {})
+
+    weapon_items = state.get("weapon_detections", [])
+
+    cols = st.columns(6)
+
+    cols[0].metric(
+        "Active cameras",
+        int(
+            capture is not None
+            and capture.is_webcam
+            and capture.is_running
+        ),
+        border=True,
+    )
+    cols[1].metric(
+        "People detected",
+        state.get("people_detected", 0),
+        border=True,
+    )
+    cols[2].metric(
+        "Weapon detections",
+        len(weapon_items),
+        border=True,
+    )
+    cols[3].metric(
+        "Total incidents",
+        summary["total"] if summary else "Unavailable",
+        border=True,
+    )
+    cols[4].metric(
+        "Today's incidents",
+        summary["today"] if summary else "Unavailable",
+        border=True,
+    )
+    cols[5].metric(
+        "Inference FPS",
+        f"{result.get('inference_fps', 0.0):.1f}",
+        border=True,
+    )
+
+    if summary_error:
+        st.warning(summary_error)
+
+    alerts, error = fetch_incidents(limit=200)
+
+    if error:
+        st.warning(error)
+        return
+
+    valid = [row for row in alerts if isinstance(row, dict)]
+
+    if not valid:
+        st.info("No stored incidents are available yet.")
+    else:
+        frame = pd.DataFrame(valid)
+        left, right = st.columns(2)
+
+        with left:
+            st.subheader("Incidents by severity")
+            if "threat_level" in frame:
+                st.bar_chart(
+                    frame["threat_level"].fillna("Unknown").value_counts(),
+                    horizontal=True,
+                )
+
+        with right:
+            st.subheader("Incidents by class")
+            if "label" in frame:
+                st.bar_chart(
+                    frame["label"].fillna("Unknown").value_counts(),
+                    horizontal=True,
+                )
+
+        if "created_at" in frame:
+            frame["created_at"] = pd.to_datetime(
+                frame["created_at"],
                 errors="coerce",
                 utc=True,
             )
-            if raw_created_at is not None
-            else pd.NaT
+            timed = frame.dropna(subset=["created_at"])
+
+            if not timed.empty:
+                st.subheader("Incident activity over time")
+                hourly = timed.groupby(
+                    pd.Grouper(key="created_at", freq="h")
+                ).size()
+                st.line_chart(hourly)
+
+
+# ============================================================
+# ALERT HISTORY PAGE
+# ============================================================
+
+@st.fragment(run_every="30s")
+def render_alert_history():
+    st.title("Alert history")
+    st.caption("Stored incidents returned by the FastAPI backend")
+
+    summary, summary_error = fetch_incident_summary()
+
+    if summary_error:
+        st.warning(summary_error)
+
+    if summary:
+        cols = st.columns(3)
+        cols[0].metric("Total incidents", summary["total"])
+        cols[1].metric("Today's incidents", summary["today"])
+        cols[2].metric(
+            "Classes recorded",
+            len(summary.get("by_class", {})),
         )
-        row["threat_level"] = str(row.get("threat_level") or "Unknown")
-        row["label"] = str(row.get("label") or "Unknown")
-        row["camera_id"] = str(row.get("camera_id") or "Unknown")
-        records.append(row)
-    if invalid_rows:
-        st.warning(f"Ignored {invalid_rows} malformed incident record(s).")
-    if not records:
-        st.info("The API returned no valid incident records.")
+
+        if summary.get("by_class"):
+            st.subheader("Incidents by class")
+            st.dataframe(
+                pd.DataFrame([
+                    {"Class": name, "Count": count}
+                    for name, count in summary["by_class"].items()
+                ]),
+                hide_index=True,
+                width="stretch",
+            )
+
+    alerts, error = fetch_incidents(limit=200)
+
+    if error:
+        st.error(error)
         return
 
-    df = pd.DataFrame(records)
-    search = st.text_input("Search incidents", placeholder="Class, camera, or severity")
-    severity_values = sorted(df["threat_level"].dropna().unique().tolist())
-    selected_severity = st.multiselect("Severity", severity_values, default=severity_values)
-    class_values = sorted(df["label"].dropna().unique().tolist())
-    selected_classes = st.multiselect("Class or event", class_values, default=class_values)
-    date_values = df["created_at"].dropna()
-    if not date_values.empty:
-        min_date = date_values.min().date()
-        max_date = date_values.max().date()
-    else:
-        min_date = max_date = date.today()
-    date_range = st.date_input(
-        "Date range",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date,
+    if not alerts:
+        st.info("No incidents found.")
+        return
+
+    df, invalid_count = normalize_incidents(alerts)
+
+    if invalid_count:
+        st.warning(f"Ignored {invalid_count} malformed records.")
+
+    if df.empty:
+        st.info("No valid incident records were returned.")
+        return
+
+    search = st.text_input(
+        "Search",
+        placeholder="Class, camera, or severity",
+    )
+
+    severity_options = sorted(
+        df["threat_level"].dropna().unique().tolist()
+    )
+    class_options = sorted(
+        df["label"].dropna().unique().tolist()
+    )
+
+    selected_severity = st.multiselect(
+        "Severity",
+        severity_options,
+        default=severity_options,
+    )
+    selected_classes = st.multiselect(
+        "Class",
+        class_options,
+        default=class_options,
     )
 
     filtered = df[
         df["threat_level"].isin(selected_severity)
         & df["label"].isin(selected_classes)
     ].copy()
+
     if search:
         searchable = filtered[
             ["threat_level", "label", "camera_id"]
         ].fillna("").astype(str).agg(" ".join, axis=1)
-        filtered = filtered[searchable.str.contains(search, case=False, na=False)]
-    if isinstance(date_range, tuple) and len(date_range) == 2:
-        start_date, end_date = date_range
-        start = pd.Timestamp(datetime.combine(start_date, datetime_time.min), tz="UTC")
-        end = pd.Timestamp(datetime.combine(end_date, datetime_time.max), tz="UTC")
+
         filtered = filtered[
-            filtered["created_at"].isna()
-            | filtered["created_at"].between(start, end)
+            searchable.str.contains(
+                search,
+                case=False,
+                na=False,
+            )
         ]
 
-    table_columns = [
-        column
-        for column in (
-            "created_at", "threat_level", "label", "confidence", "camera_id", "id"
+    columns = [
+        column for column in (
+            "created_at",
+            "threat_level",
+            "detected_class",
+            "confidence",
+            "tracking_id",
+            "notification_status",
+            "notification_error",
+            "camera_id",
+            "id",
         )
         if column in filtered.columns
     ]
-    st.dataframe(filtered[table_columns], hide_index=True, width="stretch")
+
+    st.dataframe(
+        filtered[columns],
+        hide_index=True,
+        width="stretch",
+    )
+
     st.download_button(
-        "Export filtered alerts as CSV",
-        data=filtered[table_columns].to_csv(index=False).encode("utf-8"),
+        "Export incidents as CSV",
+        data=filtered[columns].to_csv(
+            index=False
+        ).encode("utf-8"),
         file_name="smartvision-alerts.csv",
         mime="text/csv",
-        icon=":material/download:",
     )
 
     st.subheader("Incident details")
-    for _, alert in filtered.iterrows():
+
+    for _, incident in filtered.iterrows():
         title = (
-            f"{alert['created_at'] if pd.notna(alert['created_at']) else 'Unknown time'} · "
-            f"{alert['threat_level']} · {alert['label']}"
+            f"{incident.get('created_at')} · "
+            f"{incident.get('threat_level')} · "
+            f"{incident.get('label')}"
         )
+
         with st.expander(title):
-            image_col, detail_col = st.columns([1, 2])
-            with image_col:
-                image_path = alert.get("image_path")
+            left, right = st.columns([1, 2])
+
+            with left:
+                image_path = incident.get("image_path")
+
                 if isinstance(image_path, str) and image_path:
                     candidate = os.path.normpath(
-                        image_path if os.path.isabs(image_path)
+                        image_path
+                        if os.path.isabs(image_path)
                         else os.path.join(ROOT_DIR, image_path)
                     )
+
                     try:
-                        within_root = os.path.commonpath(
-                            [os.path.abspath(ROOT_DIR), os.path.abspath(candidate)]
-                        ) == os.path.abspath(ROOT_DIR)
+                        safe_path = (
+                            os.path.commonpath([
+                                os.path.abspath(ROOT_DIR),
+                                os.path.abspath(candidate),
+                            ]) == os.path.abspath(ROOT_DIR)
+                        )
                     except ValueError:
-                        within_root = False
-                    if within_root and os.path.isfile(candidate):
-                        st.image(candidate, caption="Incident snapshot", width="stretch", alt="Incident snapshot")
+                        safe_path = False
+
+                    if safe_path and os.path.isfile(candidate):
+                        st.image(
+                            candidate,
+                            caption="Incident snapshot",
+                            width="stretch",
+                        )
                     else:
-                        st.caption("Snapshot is unavailable.")
+                        st.caption("Snapshot unavailable.")
                 else:
-                    st.caption("No snapshot was attached.")
-            with detail_col:
-                st.write("Incident ID:", alert.get("id") or "Unavailable")
-                st.write("Camera:", alert.get("camera_id", "Unknown"))
-                confidence = alert.get("confidence")
+                    st.caption("No snapshot attached.")
+
+            with right:
+                st.write("Incident ID:", incident.get("id", "Unknown"))
+                st.write("Camera:", incident.get("camera_id", "Unknown"))
+                st.write(
+                    "Detected class:",
+                    incident.get("detected_class", "Unknown"),
+                )
+                st.write(
+                    "Tracking ID:",
+                    incident.get("tracking_id", "Unknown"),
+                )
+
+                confidence = incident.get("confidence")
+
                 st.write(
                     "Confidence:",
-                    f"{confidence:.1%}" if isinstance(confidence, (float, int)) else "Unavailable",
+                    f"{confidence:.1%}"
+                    if isinstance(confidence, (float, int))
+                    else "Unavailable",
                 )
-                incident_data = alert.get("data")
-                if isinstance(incident_data, (dict, list)):
-                    st.json(incident_data)
-                elif incident_data is not None:
-                    st.caption("Incident details are malformed.")
+
+                st.write(
+                    "Notification:",
+                    incident.get("notification_status", "unknown"),
+                )
+
+                if incident.get("notification_error"):
+                    st.warning(incident["notification_error"])
 
 
-# --------------------------------------------------
+# ============================================================
+# CAMERA MANAGEMENT PAGE
+# ============================================================
+
+def render_camera_management():
+    st.title("Camera management")
+
+    st.number_input(
+        "Webcam device index",
+        min_value=0,
+        max_value=16,
+        value=int(
+            st.session_state.get(
+                "smartvision_camera_index",
+                WEBCAM_ID,
+            )
+        ),
+        step=1,
+        key="smartvision_camera_index",
+    )
+
+    capture = st.session_state.get("smartvision_capture")
+
+    with st.container(border=True):
+        st.subheader("Camera status")
+
+        if capture is not None and capture.is_running:
+            st.success("Camera capture is running.")
+            st.write(
+                "Capture FPS:",
+                f"{capture.capture_fps:.1f}",
+            )
+            st.write(
+                "Capture resolution:",
+                getattr(capture, "resolution", "See live metrics"),
+            )
+        else:
+            st.info("No camera is currently streaming.")
+
+    st.caption(
+        "Select Live Webcam under Live detection and press Start "
+        "to connect to the configured camera."
+    )
+
+
+# ============================================================
+# DETECTION SETTINGS PAGE
+# ============================================================
+
+def render_detection_settings(runtime):
+    st.title("Detection settings")
+    st.caption("Adjust inference speed and confidence thresholds.")
+
+    detector = runtime["detector"]
+    class_ids = available_class_ids(detector)
+
+    # Use a persistent state key so Streamlit preserves the selection.
+    if "smartvision_yolo_input_size" not in st.session_state:
+        initial_size = current_image_size()
+        st.session_state["smartvision_yolo_input_size"] = initial_size
+
+    current_size = st.session_state["smartvision_yolo_input_size"]
+
+    if current_size not in IMAGE_SIZE_OPTIONS:
+        current_size = 320
+        st.session_state["smartvision_yolo_input_size"] = 320
+
+    st.select_slider(
+        "YOLO input size",
+        options=IMAGE_SIZE_OPTIONS,
+        value=current_size,
+        key="smartvision_yolo_input_size",
+        help=(
+            "320 is the recommended starting point for CPU webcam "
+            "inference. Larger sizes may improve small-object detail "
+            "but increase processing time."
+        ),
+    )
+
+    st.session_state["smartvision_image_size"] = int(
+        st.session_state["smartvision_yolo_input_size"]
+    )
+
+    st.caption(
+        f"Selected inference size: "
+        f"{st.session_state['smartvision_image_size']} × "
+        f"{st.session_state['smartvision_image_size']}"
+    )
+
+    st.divider()
+    st.subheader("Detection classes")
+
+    options = [
+        (5, "Person"),
+        (2, "Firearm"),
+        (4, "Knife or blade"),
+    ]
+    options = [
+        item for item in options if item[0] in class_ids
+    ]
+
+    enabled = set(
+        st.session_state.get(
+            "smartvision_enabled_classes",
+            class_ids,
+        )
+    )
+
+    for class_id, label in options:
+        value = st.checkbox(
+            f"Enable {label} detection",
+            value=class_id in enabled,
+            key=f"enable_class_{class_id}",
+        )
+
+        if value:
+            enabled.add(class_id)
+        else:
+            enabled.discard(class_id)
+
+    st.session_state["smartvision_enabled_classes"] = enabled
+
+    st.divider()
+    st.subheader("Confidence thresholds")
+
+    global_threshold = float(
+        st.session_state.get(
+            "smartvision_confidence_threshold",
+            CONFIDENCE_THRESHOLD,
+        )
+    )
+
+    st.session_state["smartvision_confidence_threshold"] = st.slider(
+        "Global minimum confidence",
+        min_value=0.05,
+        max_value=0.99,
+        value=min(0.99, max(0.05, global_threshold)),
+        step=0.05,
+        key="smartvision_global_confidence",
+    )
+
+    thresholds = dict(
+        st.session_state.get(
+            "smartvision_class_thresholds",
+            CLASS_CONFIDENCE_THRESHOLDS,
+        )
+    )
+
+    for class_id, label in options:
+        threshold = float(
+            thresholds.get(class_id, CONFIDENCE_THRESHOLD)
+        )
+
+        thresholds[class_id] = st.slider(
+            f"{label} confidence",
+            min_value=0.05,
+            max_value=0.99,
+            value=min(0.99, max(0.05, threshold)),
+            step=0.05,
+            key=f"class_threshold_{class_id}",
+        )
+
+    st.session_state["smartvision_class_thresholds"] = thresholds
+
+    st.divider()
+    st.subheader("Incident cooldown")
+
+    manager = runtime["threat_manager"]
+
+    manager.log_cooldown = st.slider(
+        "Cooldown per source and event (seconds)",
+        min_value=1,
+        max_value=300,
+        value=int(manager.log_cooldown),
+        step=1,
+    )
+
+    st.info(
+        "Changing the input size affects inference speed and may affect "
+        "small-object detection. Validate accuracy at the selected size."
+    )
+
+
+# ============================================================
+# MODEL AND SYSTEM HEALTH PAGE
+# ============================================================
+
+def render_system_health(runtime):
+    st.title("Model and system health")
+
+    if runtime is None or runtime.get("detector") is None:
+        st.error("Detector is unavailable.")
+        return
+
+    detector = runtime["detector"]
+    health = get_api_health_monitor().snapshot()
+
+    columns = st.columns(3)
+    columns[0].metric("Device", str(runtime["device"]))
+    columns[1].metric(
+        "YOLO input size",
+        current_image_size(),
+    )
+    columns[2].metric(
+        "API response time",
+        f"{health['latency_ms']:.0f} ms"
+        if health.get("latency_ms") is not None
+        else "Unavailable",
+    )
+
+    st.subheader("YOLO detector")
+
+    if getattr(detector, "is_custom_model", False):
+        if getattr(detector, "is_validated", False):
+            st.success("Custom detector validation record found.")
+        else:
+            st.warning(
+                getattr(
+                    detector,
+                    "model_diagnostic",
+                    "Custom model has not been validated.",
+                )
+            )
+    else:
+        st.warning(
+            "A generic model is active. Do not treat its results as "
+            "validated weapon detection."
+        )
+
+    st.write(
+        "Production alerts enabled:",
+        bool(getattr(detector, "alerts_enabled", False)),
+    )
+    st.write(
+        "Weapon classes available:",
+        bool(
+            getattr(detector, "weapon_detection_available", False)
+        ),
+    )
+
+    names = detector.class_names or {}
+    class_names = (
+        list(names.values()) if isinstance(names, dict)
+        else list(names)
+    )
+    st.write("Model classes:", ", ".join(map(str, class_names)))
+
+    st.subheader("Action recognition and pose")
+
+    st.write(
+        "LSTM:",
+        "Loaded" if runtime["lstm_model"] is not None
+        else "Unavailable",
+    )
+
+    worker = st.session_state.get("smartvision_worker")
+    pose = worker.pose_estimator if worker is not None else None
+
+    if runtime["lstm_model"] is None:
+        st.info(
+            "Install a compatible LSTM checkpoint to enable "
+            "action recognition."
+        )
+    elif pose is not None and pose.available:
+        st.success("MediaPipe pose estimation is available.")
+    else:
+        st.warning(
+            getattr(
+                pose,
+                "diagnostic",
+                "MediaPipe has not been initialized by a running worker.",
+            )
+        )
+
+    st.write(
+        "ByteTrack:",
+        "Running" if worker is not None and worker.is_running
+        else "Not running",
+    )
+
+    st.subheader("FastAPI and storage")
+
+    st.write(
+        "Backend:",
+        "Online" if health["healthy"] is True else "Unavailable",
+    )
+    st.write(
+        "Database:",
+        health.get("database_status", "unknown"),
+    )
+    st.write(
+        "Phone notifications:",
+        health.get("notification_status", "unknown"),
+    )
+
+    if health.get("error"):
+        st.warning(health["error"])
+
+    if health.get("database_error"):
+        st.warning(health["database_error"])
+
+    if health.get("notification_error"):
+        st.warning(health["notification_error"])
+
+    if health.get("notification_status") == "ready":
+        if st.button("Send safe test notification"):
+            sent, message = send_test_notification()
+
+            if sent:
+                st.success(message)
+            else:
+                st.error(message)
+
+    delivery = runtime["threat_manager"].get_delivery_health()
+
+    st.write("Pending alert queue:", delivery.get("queued", 0))
+
+    if not delivery.get("enabled"):
+        st.warning(
+            "Alert delivery is disabled: "
+            + str(delivery.get("disabled_reason"))
+        )
+
+
+# ============================================================
 # MAIN NAVIGATION
-# --------------------------------------------------
+# ============================================================
 
 def main():
     runtime = init_models_and_helpers()
-    _render_status_header(runtime)
-    app_mode = st.sidebar.radio(
+    render_status_header(runtime)
+
+    page = st.sidebar.radio(
         "Navigation",
         [
             "Overview",
@@ -1291,19 +1796,27 @@ def main():
             "Model and system health",
         ],
     )
-    if app_mode == "Overview":
-        _render_overview()
-    elif app_mode == "Live detection":
+
+    if page == "Overview":
+        render_overview()
+
+    elif page == "Live detection":
         run_streamlit_inference_page()
-    elif app_mode == "Alert history":
-        show_alert_history()
-    elif app_mode == "Camera management":
-        _render_camera_management()
-    elif app_mode == "Detection settings":
-        if runtime is not None:
-            _render_detection_settings(runtime)
-    else:
-        _render_system_health(runtime)
+
+    elif page == "Alert history":
+        render_alert_history()
+
+    elif page == "Camera management":
+        render_camera_management()
+
+    elif page == "Detection settings":
+        if runtime is None:
+            st.error("The detector could not be loaded.")
+        else:
+            render_detection_settings(runtime)
+
+    elif page == "Model and system health":
+        render_system_health(runtime)
 
 
 if __name__ == "__main__":

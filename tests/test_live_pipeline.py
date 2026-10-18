@@ -1,6 +1,7 @@
 import json
 import hashlib
 import queue
+import threading
 import tempfile
 import time
 import unittest
@@ -10,15 +11,26 @@ from unittest.mock import patch
 
 import numpy as np
 import requests
+import cv2
+import yaml
 
-from pipeline.inference_worker import InferenceWorker, prepare_frame
+from pipeline.inference_worker import (
+    InferenceWorker,
+    annotate_source_frame,
+    prepare_frame,
+)
 from pipeline.latest_frame_capture import LatestFrameCapture
-from pipeline.run_inference import draw_weapon_boxes, get_canonical_class_id
+from pipeline.run_inference import (
+    draw_weapon_boxes,
+    get_canonical_class_id,
+    run_yolo_detection,
+)
 from scripts.prepare_detection_dataset import (
     _convert_label_row,
     prepare_detection_dataset,
 )
 from src.core.threat_manager import ThreatManager
+from src.config import EXPECTED_DETECTOR_CLASSES, ROOT_DIR, YOLO_MODEL_PATH
 from src.modeling.detectors.yolo_detector import YOLODetector
 from src.modeling.trackers.byte_tracker import ByteTracker
 
@@ -28,6 +40,9 @@ class _Response:
 
     def raise_for_status(self):
         return None
+
+    def json(self):
+        return {"id": "persisted-test-incident"}
 
 
 class _Session:
@@ -54,11 +69,13 @@ class _StreamingCapture:
         self.frames_before_disconnect = frames_before_disconnect
         self.frames_read = 0
         self.released = False
+        self.properties = {}
 
     def isOpened(self):
         return True
 
-    def set(self, *_):
+    def set(self, property_id, value):
+        self.properties[property_id] = value
         return True
 
     def get(self, *_):
@@ -94,7 +111,151 @@ class _FakeDetector(YOLODetector):
         self.is_custom_model = is_custom_model
 
 
+class LocalYOLOIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        model_path = Path(YOLO_MODEL_PATH)
+        fallback_path = Path(ROOT_DIR) / "yolo11s.pt"
+        if not model_path.is_file() and not fallback_path.is_file():
+            raise unittest.SkipTest("No local YOLO checkpoint is available")
+
+        image_directory = Path(ROOT_DIR) / "The_final-4" / "test" / "images"
+        cls.sample_image = next(
+            (
+                path
+                for path in sorted(image_directory.iterdir())
+                if path.is_file()
+                and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+            ),
+            None,
+        ) if image_directory.is_dir() else None
+        if cls.sample_image is None:
+            raise unittest.SkipTest("No real local dataset image is available")
+
+        cls.detector = YOLODetector()
+        cls.detector.load_model(model_path)
+
+    def test_dataset_yaml_class_ids_match_training_contract(self):
+        dataset_yaml = Path(ROOT_DIR) / "The_final-4" / "data.yaml"
+        with dataset_yaml.open("r", encoding="utf-8-sig") as yaml_file:
+            dataset = yaml.safe_load(yaml_file)
+        names = dataset["names"]
+        if isinstance(names, dict):
+            class_names = tuple(
+                str(names[index]).strip().lower()
+                for index in sorted(names)
+            )
+        else:
+            class_names = tuple(str(name).strip().lower() for name in names)
+        self.assertEqual(class_names, EXPECTED_DETECTOR_CLASSES)
+
+    def test_loaded_checkpoint_and_class_capabilities_are_truthful(self):
+        self.assertTrue(Path(self.detector.model_path).is_file())
+        self.assertTrue(self.detector.loaded_class_map)
+        if self.detector.is_custom_model:
+            loaded_names = tuple(
+                name.lower()
+                for _, name in sorted(self.detector.loaded_class_map.items())
+            )
+            self.assertEqual(loaded_names, EXPECTED_DETECTOR_CLASSES)
+            self.assertTrue(self.detector.weapon_detection_available)
+        else:
+            self.assertFalse(self.detector.weapon_detection_available)
+            self.assertNotIn("gun", self.detector.loaded_class_map.values())
+            self.assertNotIn("rifle", self.detector.loaded_class_map.values())
+            generic_knife_id = next(
+                index
+                for index, name in self.detector.class_names.items()
+                if str(name).strip().lower() == "knife"
+            )
+            self.assertEqual(
+                get_canonical_class_id(self.detector, generic_knife_id),
+                -1,
+            )
+
+    def test_real_dataset_image_inference_returns_valid_boxes_and_scores(self):
+        image = cv2.imread(str(self.sample_image))
+        self.assertIsNotNone(image)
+        results = self.detector.predict(image, conf=0.1, imgsz=416, iou=0.7)
+        self.assertEqual(len(results), 1)
+        boxes = results[0].boxes
+        if boxes is None:
+            return
+        for box in boxes:
+            coordinates = np.asarray(box.xyxy[0].tolist(), dtype=np.float64)
+            confidence = float(box.conf[0])
+            self.assertEqual(coordinates.shape, (4,))
+            self.assertTrue(np.isfinite(coordinates).all())
+            self.assertGreater(coordinates[2], coordinates[0])
+            self.assertGreater(coordinates[3], coordinates[1])
+            self.assertGreaterEqual(confidence, 0.1)
+            self.assertLessEqual(confidence, 1.0)
+
+
 class LivePipelineTests(unittest.TestCase):
+    def test_custom_weapon_class_names_map_to_project_ids(self):
+        detector = SimpleNamespace(
+            class_names={
+                0: "atm",
+                1: "backpack",
+                2: "gun",
+                3: "handbag",
+                4: "knife",
+                5: "person",
+            },
+            is_custom_model=True,
+        )
+        self.assertEqual(get_canonical_class_id(detector, 2), 2)
+        self.assertEqual(get_canonical_class_id(detector, 4), 4)
+        self.assertEqual(get_canonical_class_id(detector, 6), -1)
+        self.assertEqual(
+            get_canonical_class_id(
+                SimpleNamespace(class_names=None, is_custom_model=False),
+                2,
+            ),
+            -1,
+        )
+
+    def test_yolo_inference_uses_bgr_frame_and_configured_parameters(self):
+        frame = np.zeros((48, 64, 3), dtype=np.uint8)
+        detector = SimpleNamespace(predict=lambda *args, **kwargs: (args, kwargs))
+
+        args, kwargs = run_yolo_detection(
+            detector,
+            frame,
+            confidence_threshold=0.25,
+            image_size=640,
+        )
+
+        self.assertIs(args[0], frame)
+        self.assertEqual(kwargs["conf"], 0.25)
+        self.assertEqual(kwargs["imgsz"], 640)
+        self.assertEqual(kwargs["iou"], 0.70)
+
+    def test_valid_weapon_prediction_is_drawn_as_a_project_class(self):
+        detector = SimpleNamespace(
+            class_names={2: "gun"},
+            is_custom_model=True,
+        )
+        box = SimpleNamespace(
+            xyxy=np.asarray([[10, 12, 40, 52]], dtype=np.float32),
+            conf=np.asarray([0.91], dtype=np.float32),
+            cls=np.asarray([2], dtype=np.float32),
+        )
+
+        detections = draw_weapon_boxes(
+            detector,
+            np.zeros((64, 64, 3), dtype=np.uint8),
+            [SimpleNamespace(boxes=[box])],
+            confidence_threshold=0.1,
+        )
+
+        self.assertEqual(len(detections), 1)
+        self.assertEqual(detections[0]["class"], "gun")
+        self.assertEqual(detections[0]["class_id"], 2)
+        self.assertTrue(detections[0]["is_project_class"])
+        self.assertAlmostEqual(detections[0]["confidence"], 0.91, places=6)
+
     def test_webcam_capture_keeps_only_the_latest_frame_and_stops(self):
         fake_capture = _StreamingCapture()
         with patch(
@@ -113,6 +274,37 @@ class LivePipelineTests(unittest.TestCase):
             self.assertGreaterEqual(skipped, 0)
             self.assertIsNotNone(captured_at)
             self.assertGreater(capture.capture_fps, 0)
+            self.assertEqual(
+                fake_capture.properties[cv2.CAP_PROP_FRAME_WIDTH],
+                1280,
+            )
+            self.assertEqual(
+                fake_capture.properties[cv2.CAP_PROP_FRAME_HEIGHT],
+                720,
+            )
+            self.assertTrue(capture.stop(timeout=1.0))
+            self.assertTrue(fake_capture.released)
+
+    def test_video_file_capture_uses_bounded_queue_and_stops(self):
+        fake_capture = _StreamingCapture()
+        with patch(
+            "pipeline.latest_frame_capture.cv2.VideoCapture",
+            return_value=fake_capture,
+        ):
+            capture = LatestFrameCapture("fixture.avi", file_queue_size=2)
+            self.assertTrue(capture.wait_until_ready(timeout=1.0))
+            self.assertEqual(capture._file_frames.maxsize, 2)
+            frames = []
+            deadline = time.monotonic() + 1.0
+            while len(frames) < 3 and time.monotonic() < deadline:
+                result = capture.read()
+                if result is not None:
+                    frames.append(result)
+                else:
+                    time.sleep(0.005)
+
+            self.assertEqual(len(frames), 3)
+            self.assertEqual(frames[0][0].shape, (8, 8, 3))
             self.assertTrue(capture.stop(timeout=1.0))
             self.assertTrue(fake_capture.released)
 
@@ -133,15 +325,19 @@ class LivePipelineTests(unittest.TestCase):
             capture = LatestFrameCapture(0)
             self.assertTrue(capture.wait_until_ready(timeout=1.0))
             deadline = time.monotonic() + 3.0
+            recovered_frame = None
             while (
-                len(captures) < 2 or not capture.opened
+                len(captures) < 2
+                or not capture.opened
+                or recovered_frame is None
             ) and time.monotonic() < deadline:
+                recovered_frame = capture.read(0)
                 time.sleep(0.01)
 
             self.assertGreaterEqual(len(captures), 2)
             self.assertTrue(capture.opened)
             self.assertIsNone(capture.error)
-            self.assertIsNotNone(capture.read(0))
+            self.assertIsNotNone(recovered_frame)
             self.assertTrue(capture.stop(timeout=1.0))
             self.assertTrue(all(item.released for item in captures))
 
@@ -237,6 +433,9 @@ class LivePipelineTests(unittest.TestCase):
     def test_bytetrack_advances_on_empty_frames_and_keeps_track(self):
         tracker = ByteTracker()
 
+        unconfirmed = tracker.update([([10, 10, 100, 120], 0.95, 5)])
+        self.assertEqual(len(unconfirmed), 0)
+
         first = tracker.update([([10, 10, 100, 120], 0.95, 5)])
         self.assertEqual(len(first), 1)
         first_track_id = int(first.tracker_id[0])
@@ -248,10 +447,20 @@ class LivePipelineTests(unittest.TestCase):
         self.assertEqual(len(second), 1)
         self.assertEqual(int(second.tracker_id[0]), first_track_id)
 
+    def test_bytetrack_tracks_person_above_activation_threshold(self):
+        tracker = ByteTracker()
+        first = tracker.update([([10, 10, 100, 120], 0.38, 5)])
+        self.assertEqual(len(first), 0)
+
+        second = tracker.update([([11, 10, 101, 120], 0.38, 5)])
+        self.assertEqual(len(second), 1)
+        self.assertGreaterEqual(int(second.tracker_id[0]), 0)
+
     def test_bytetrack_lost_window_tracks_inference_cadence(self):
         tracker = ByteTracker()
         tracker.set_frame_rate(2.5)
-        self.assertEqual(tracker.tracker.max_time_lost, 5)
+        self.assertEqual(tracker.max_time_lost, 5)
+        tracker.update([([10, 10, 100, 120], 0.95, 5)])
         first = tracker.update([([10, 10, 100, 120], 0.95, 5)])
         first_track_id = int(first.tracker_id[0])
 
@@ -289,6 +498,23 @@ class LivePipelineTests(unittest.TestCase):
         self.assertIs(prepare_frame(frame), frame)
         resized = prepare_frame(np.zeros((1080, 1920, 3), dtype=np.uint8))
         self.assertEqual(resized.shape, (360, 640, 3))
+
+    def test_high_resolution_overlay_scales_boxes_without_mutating_source(self):
+        source = np.zeros((128, 128, 3), dtype=np.uint8)
+        annotated = annotate_source_frame(
+            source,
+            [{
+                "class": "backpack",
+                "confidence": 0.91,
+                "bbox": [10, 32, 20, 50],
+            }],
+            [],
+            (64, 64, 3),
+        )
+
+        self.assertEqual(annotated.shape, source.shape)
+        self.assertTrue(np.all(source == 0))
+        self.assertTrue(np.array_equal(annotated[80, 20], [40, 190, 240]))
 
     def test_custom_detector_requires_operator_approval_for_alerts(self):
         from src.config import EXPECTED_DETECTOR_CLASSES
@@ -349,6 +575,60 @@ class LivePipelineTests(unittest.TestCase):
                 approved_detector.load_model(str(weights_path))
                 self.assertTrue(approved_detector.alerts_enabled)
 
+    def test_corrupt_custom_detector_uses_generic_fallback_with_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            models_directory = root / "models"
+            models_directory.mkdir()
+            custom_path = models_directory / "yolo11s_fine_tune_v3.pt"
+            fallback_path = root / "yolo11s.pt"
+            custom_path.write_bytes(b"corrupt" * 2000)
+            fallback_path.write_bytes(b"fallback" * 2000)
+            fallback_model = SimpleNamespace(names={0: "person"})
+
+            with (
+                patch("src.modeling.detectors.yolo_detector.ROOT_DIR", str(root)),
+                patch(
+                    "src.modeling.detectors.yolo_detector.YOLO",
+                    side_effect=[RuntimeError("invalid checkpoint"), fallback_model],
+                ) as yolo_loader,
+            ):
+                detector = YOLODetector()
+                detector.load_model(str(custom_path))
+
+            self.assertEqual(yolo_loader.call_count, 2)
+            self.assertEqual(detector.model_path, fallback_path)
+            self.assertFalse(detector.is_custom_model)
+            self.assertFalse(detector.alerts_enabled)
+            self.assertIn("invalid checkpoint", detector.model_diagnostic)
+            self.assertIn("general-purpose COCO fallback", detector.model_diagnostic)
+            self.assertIn("not counted as a validated weapon", detector.model_diagnostic)
+
+    def test_missing_custom_checkpoint_marks_generic_fallback_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fallback_path = root / "yolo11s.pt"
+            fallback_path.write_bytes(b"fallback" * 2000)
+            fallback_model = SimpleNamespace(
+                names={0: "person", 43: "knife"},
+            )
+
+            with (
+                patch("src.modeling.detectors.yolo_detector.ROOT_DIR", str(root)),
+                patch(
+                    "src.modeling.detectors.yolo_detector.YOLO",
+                    return_value=fallback_model,
+                ),
+            ):
+                detector = YOLODetector()
+                detector.load_model(root / "models" / "missing.pt")
+
+            self.assertEqual(detector.model_path, fallback_path)
+            self.assertFalse(detector.weapon_detection_available)
+            self.assertIn("checkpoint is missing", detector.model_diagnostic)
+            self.assertIn("no gun, pistol, rifle", detector.model_diagnostic)
+            self.assertFalse(detector.alerts_enabled)
+
     def test_alert_delivery_reports_success_and_failure_and_deduplicates(self):
         session = _Session([
             _Response(),
@@ -404,10 +684,25 @@ class LivePipelineTests(unittest.TestCase):
         self.assertEqual(manager._alert_queue.unfinished_tasks, 0)
         self.assertEqual(len(session.requests), 3)
         first_request = session.requests[0][1]
+        first_payload = json.loads(first_request["data"]["incident_data"])
+        retry_payload = json.loads(
+            session.requests[1][1]["data"]["incident_data"]
+        )
+        second_event_payload = json.loads(
+            session.requests[2][1]["data"]["incident_data"]
+        )
+        self.assertEqual(
+            retry_payload["data"]["idempotency_key"],
+            second_event_payload["data"]["idempotency_key"],
+        )
+        self.assertNotEqual(
+            first_payload["data"]["idempotency_key"],
+            retry_payload["data"]["idempotency_key"],
+        )
         self.assertEqual(first_request["timeout"], (0.5, 2.0))
         self.assertIn("_multipart", first_request["files"])
         self.assertNotIn("file", first_request["files"])
-        posted_payload = json.loads(first_request["data"]["incident_data"])
+        posted_payload = first_payload
         self.assertEqual(
             set(posted_payload["data"]),
             {
@@ -415,6 +710,7 @@ class LivePipelineTests(unittest.TestCase):
                 "detections",
                 "action_classification",
                 "spatial_context",
+                "idempotency_key",
             },
         )
         from server.schemas import IncidentCreate
@@ -434,7 +730,7 @@ class LivePipelineTests(unittest.TestCase):
 
     def test_failed_delivery_records_all_retries_and_never_reports_success(self):
         session = _Session([
-            requests.ConnectionError("backend offline"),
+            requests.Timeout("backend request timed out"),
             requests.ConnectionError("backend offline"),
             requests.ConnectionError("backend offline"),
         ])
@@ -468,16 +764,19 @@ class LivePipelineTests(unittest.TestCase):
         self.assertIn("backend offline", incident["error"])
         self.assertFalse(manager.get_delivery_health()["healthy"])
 
-    def test_production_gate_disabled_records_local_event_without_sending(self):
+    def test_production_gate_disabled_still_persists_without_authorizing_notifications(self):
+        session = _Session([_Response()])
         with (
             patch("src.core.threat_manager.ALERTS_ENABLED", True),
             patch("src.core.threat_manager.ALERT_ENDPOINT_VERIFIED", False),
-            patch("src.core.threat_manager.requests.Session") as session,
+            patch(
+                "src.core.threat_manager.requests.Session",
+                return_value=session,
+            ),
         ):
             manager = ThreatManager(alerts_enabled=True)
             self.addCleanup(manager.close)
             self.assertFalse(manager.alerts_enabled)
-            self.assertIsNone(manager._alert_thread)
             manager.log_threat(
                 17,
                 "camera_test",
@@ -492,18 +791,25 @@ class LivePipelineTests(unittest.TestCase):
                 0.91,
                 "HIGH: WEAPON DETECTED",
             )
+            deadline = time.monotonic() + 5
+            while manager._alert_queue.unfinished_tasks and time.monotonic() < deadline:
+                time.sleep(0.01)
 
-        session.assert_not_called()
+        self.assertEqual(len(session.requests), 1)
+        posted = json.loads(
+            session.requests[0][1]["data"]["incident_data"]
+        )
+        self.assertFalse(posted["notification_authorized"])
         local_events = manager.get_incident_history()
         self.assertEqual(len(local_events), 1)
         self.assertEqual(
             local_events[0]["status"],
-            "not sent: production alerts disabled",
+            "delivered (HTTP 201)",
         )
-        self.assertIn("verified FastAPI endpoint", local_events[0]["error"])
 
     def test_full_alert_queue_is_reported_and_can_be_retried(self):
         manager = ThreatManager(alerts_enabled=False)
+        manager.close()
         manager.alerts_enabled = True
         manager._alert_queue = queue.Queue(maxsize=1)
         payload = {
@@ -556,6 +862,63 @@ class LivePipelineTests(unittest.TestCase):
             manager.threat_logs,
         )
         self.assertEqual(manager.get_delivery_health()["queued"], 1)
+
+    def test_alert_worker_drains_full_queue_and_stops_on_close(self):
+        request_started = threading.Event()
+        release_request = threading.Event()
+
+        class BlockingSession(_Session):
+            def post(self, url, **kwargs):
+                self.requests.append((url, kwargs))
+                request_started.set()
+                if not release_request.wait(timeout=2.0):
+                    raise requests.Timeout("test request timed out")
+                return _Response()
+
+        session = BlockingSession([])
+        bounded_queue = queue.Queue(maxsize=1)
+        gates = [
+            patch("src.core.threat_manager.ALERTS_ENABLED", True),
+            patch("src.core.threat_manager.ALERT_ENDPOINT_VERIFIED", True),
+            patch(
+                "src.core.threat_manager.queue.Queue",
+                return_value=bounded_queue,
+            ),
+            patch(
+                "src.core.threat_manager.requests.Session",
+                return_value=session,
+            ),
+        ]
+        for gate in gates:
+            gate.start()
+            self.addCleanup(gate.stop)
+
+        manager = ThreatManager(alerts_enabled=True)
+        self.addCleanup(manager.close)
+        manager.log_threat(
+            21,
+            "camera_test",
+            "knife detection",
+            0.91,
+            "HIGH: WEAPON DETECTED",
+        )
+        self.assertTrue(request_started.wait(timeout=1.0))
+        manager.log_threat(
+            22,
+            "camera_test",
+            "gun detection",
+            0.96,
+            "HIGH: WEAPON DETECTED",
+        )
+        self.assertEqual(bounded_queue.qsize(), 1)
+
+        self.assertFalse(manager.close(timeout=0.05))
+        release_request.set()
+        manager._alert_thread.join(timeout=2.0)
+
+        self.assertFalse(manager._alert_thread.is_alive())
+        self.assertEqual(bounded_queue.unfinished_tasks, 0)
+        self.assertEqual(len(session.requests), 2)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import logging
 import queue
 import threading
@@ -60,14 +61,13 @@ class ThreatManager:
         self.api_last_error = None
         self.last_enqueue_ms = 0.0
         self.frame_enqueue_ms = 0.0
-        self._alert_thread = None
-        if self.alerts_enabled:
-            self._alert_thread = threading.Thread(
-                target=self._deliver_alerts,
-                name="smartvision-alert-delivery",
-                daemon=True,
-            )
-            self._alert_thread.start()
+        self._closing_event = threading.Event()
+        self._alert_thread = threading.Thread(
+            target=self._deliver_alerts,
+            name="smartvision-incident-delivery",
+            daemon=True,
+        )
+        self._alert_thread.start()
 
     def determine_threat(self, action_label, visible_objects, duration=0.0, is_unattended_bag=False):
         """
@@ -132,7 +132,7 @@ class ThreatManager:
 
     def log_threat(self, track_id, source_name, action_label, action_prob, threat_level, frame_id=0, detections=None, spatial_context=None, frame=None):
         """
-        Logs threat to console/file and conditionally sends to server.
+        Queues a rule-validated threat for persistent API storage.
         """
         current_time = time.time()
 
@@ -159,11 +159,18 @@ class ThreatManager:
                 return
 
             from src.config import SERVER_URL
+            key_window = int(current_time // max(1.0, self.log_cooldown))
+            idempotency_key = hashlib.sha256(
+                "\0".join(map(str, (*event_key, key_window))).encode("utf-8")
+            ).hexdigest()
+            event_class = action_name.removesuffix(" detection")
             payload = {
                 "camera_id": source_name,
                 "threat_level": threat_level,
                 "label": action_label.upper(),
                 "confidence": float(action_prob),
+                "detected_class": event_class.upper(),
+                "notification_authorized": self.alerts_enabled,
                 "data": {
                     "frame_id": frame_id,
                     "detections": detections,
@@ -173,30 +180,26 @@ class ThreatManager:
                         "track_id": track_id,
                     },
                     "spatial_context": spatial_context,
+                    "idempotency_key": idempotency_key,
                 },
             }
-
-            if not self.alerts_enabled:
-                incident = self._new_incident(payload)
-                reason = self.alert_disabled_reason
-                if not SERVER_URL:
-                    reason = "FastAPI incident endpoint is not configured."
-                self._update_incident(
-                    incident,
-                    status="not sent: production alerts disabled",
-                    error=reason,
-                )
-                with self._incident_lock:
-                    self._incident_history.appendleft(incident)
-                self.threat_logs[event_key] = current_time
-                self._prune_deduplication_cache(current_time)
-                return
 
             last_failure = self._enqueue_failures.get(event_key, 0.0)
             if current_time - last_failure < 1.0:
                 return
             if not SERVER_URL:
-                self.logger.error("Alert was not sent because SERVER_URL is empty.")
+                incident = self._new_incident(payload)
+                self._update_incident(
+                    incident,
+                    status="failed",
+                    error="FastAPI incident endpoint is not configured.",
+                )
+                with self._incident_lock:
+                    self._incident_history.appendleft(incident)
+                self.logger.error(
+                    "Incident %s was not stored because SERVER_URL is empty.",
+                    incident["id"],
+                )
                 return
 
             incident = self._send_alert_async(
@@ -260,11 +263,13 @@ class ThreatManager:
             ),
             "label": payload.get("label", "Unknown"),
             "confidence": float(payload.get("confidence", 0.0)),
+            "detected_class": payload.get("detected_class"),
             "track_id": payload.get("data", {})
             .get("action_classification", {})
             .get("track_id"),
             "threat_level": payload.get("threat_level", "Unknown"),
             "status": "queued",
+            "notification_status": "unknown",
             "attempts": 0,
             "snapshot": None,
             "api_elapsed_ms": None,
@@ -274,7 +279,12 @@ class ThreatManager:
     def _deliver_alerts(self):
         with requests.Session() as session:
             while True:
-                item = self._alert_queue.get()
+                try:
+                    item = self._alert_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if self._closing_event.is_set():
+                        return
+                    continue
                 if item is None:
                     self._alert_queue.task_done()
                     return
@@ -325,9 +335,14 @@ class ThreatManager:
                                 timeout=(0.5, 2.0),
                             )
                             response.raise_for_status()
+                            response_payload = response.json()
+                            if not isinstance(response_payload, dict) or not response_payload.get("id"):
+                                raise ValueError(
+                                    "Incident API returned success without a persisted incident ID."
+                                )
                             last_error = None
                             break
-                        except requests.RequestException as exc:
+                        except (requests.RequestException, ValueError) as exc:
                             last_error = exc
                             status_code = getattr(
                                 getattr(exc, "response", None),
@@ -376,6 +391,14 @@ class ThreatManager:
                     self._update_incident(
                         incident,
                         status=f"delivered (HTTP {response.status_code})",
+                        server_incident_id=response_payload["id"],
+                        notification_status=response_payload.get(
+                            "notification_status",
+                            "unknown",
+                        ),
+                        notification_error=response_payload.get(
+                            "notification_error"
+                        ),
                         api_elapsed_ms=elapsed_ms,
                     )
                     with self._incident_lock:
@@ -459,13 +482,7 @@ class ThreatManager:
 
     def close(self, timeout=1.0):
         if self._alert_thread is None:
-            return
-        try:
-            self._alert_queue.put_nowait(None)
-        except queue.Full:
-            self.logger.error(
-                "Could not queue alert-worker shutdown; pending incidents "
-                "remain queued."
-            )
-            return
+            return True
+        self._closing_event.set()
         self._alert_thread.join(timeout=timeout)
+        return not self._alert_thread.is_alive()

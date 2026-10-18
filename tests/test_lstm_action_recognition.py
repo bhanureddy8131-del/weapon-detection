@@ -398,6 +398,7 @@ class ActionPredictionTests(unittest.TestCase):
         self.assertEqual(messages, [])
         self.assertEqual(state["people_detected"], 1)
         self.assertEqual(state["person_detections"][0]["track_id"], 17)
+        self.assertEqual(state["person_detections"][0]["bbox"], [4, 4, 40, 44])
         pose_estimator.predict.assert_not_called()
 
 

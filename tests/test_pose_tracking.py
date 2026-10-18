@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from pipeline.run_inference import update_person_history
+from pipeline.run_inference import _maintain_track_history, update_person_history
 from pipeline.run_inference import _run_single_source_offline
 from pipeline.inference_worker import InferenceWorker
 from src.modeling.classifiers.lstm import PoseSequenceBuffer
@@ -15,8 +15,35 @@ from src.modeling.trackers.byte_tracker import ByteTracker
 
 
 class ByteTrackIntegrationTests(unittest.TestCase):
+    def test_pose_history_retention_uses_wrapper_cadence_window(self):
+        tracker = ByteTracker()
+        tracker.set_frame_rate(2.5)
+        person_history = {91: PoseSequenceBuffer(30)}
+        state_data = {"person_durations": {91: 4.0}}
+        no_tracks = SimpleNamespace(tracker_id=np.asarray([], dtype=int))
+
+        for _ in range(tracker.max_time_lost):
+            _maintain_track_history(
+                no_tracks,
+                person_history,
+                state_data,
+                tracker,
+            )
+        self.assertIn(91, person_history)
+
+        _maintain_track_history(
+            no_tracks,
+            person_history,
+            state_data,
+            tracker,
+        )
+        self.assertNotIn(91, person_history)
+
     def test_track_id_survives_missing_frames_and_reset_starts_fresh_tracker(self):
         tracker = ByteTracker()
+        unconfirmed = tracker.update([([10, 10, 60, 80], 0.95, 5)])
+        self.assertEqual(len(unconfirmed), 0)
+
         first = tracker.update([([10, 10, 60, 80], 0.95, 5)])
         self.assertEqual(len(first), 1)
         initial_id = int(first.tracker_id[0])
@@ -30,6 +57,8 @@ class ByteTrackIntegrationTests(unittest.TestCase):
         previous_tracker = tracker.tracker
         tracker.reset()
         self.assertIsNot(tracker.tracker, previous_tracker)
+        restarted = tracker.update([([12, 10, 62, 80], 0.94, 5)])
+        self.assertEqual(len(restarted), 0)
         restarted = tracker.update([([12, 10, 62, 80], 0.94, 5)])
         self.assertEqual(len(restarted), 1)
 
@@ -48,6 +77,59 @@ class ByteTrackIntegrationTests(unittest.TestCase):
 
 
 class MediaPipeFailureTests(unittest.TestCase):
+    def test_worker_skips_pose_initialization_without_lstm(self):
+        class IdleCapture:
+            @property
+            def is_running(self):
+                return False
+
+            def read(self, _last_sequence):
+                return None
+
+        with patch(
+            "pipeline.inference_worker.MediaPipeEstimator",
+        ) as estimator:
+            worker = InferenceWorker(
+                IdleCapture(),
+                runtime={"lstm_model": None},
+                source_name="missing-lstm-test",
+            )
+            worker._thread.join(timeout=1.0)
+
+        estimator.assert_not_called()
+        self.assertIsNone(worker.pose_estimator)
+
+    def test_worker_stops_capture_when_capture_read_raises(self):
+        class FailedCapture:
+            stopped = False
+
+            @property
+            def is_running(self):
+                return True
+
+            def read(self, _last_sequence):
+                raise RuntimeError("capture read failed")
+
+            def stop(self):
+                self.stopped = True
+                return True
+
+        capture = FailedCapture()
+        with patch(
+            "pipeline.inference_worker.MediaPipeEstimator",
+            return_value=None,
+        ):
+            worker = InferenceWorker(
+                capture,
+                runtime={},
+                source_name="capture-failure-test",
+            )
+            worker._thread.join(timeout=1.0)
+
+        self.assertFalse(worker._thread.is_alive())
+        self.assertTrue(capture.stopped)
+        self.assertIn("capture read failed", worker.snapshot()["error"])
+
     def test_worker_keeps_running_state_when_pose_constructor_raises(self):
         class IdleCapture:
             @property
@@ -63,7 +145,7 @@ class MediaPipeFailureTests(unittest.TestCase):
         ):
             worker = InferenceWorker(
                 IdleCapture(),
-                runtime={},
+                runtime={"lstm_model": object()},
                 source_name="pose-failure-test",
             )
             worker._thread.join(timeout=1.0)

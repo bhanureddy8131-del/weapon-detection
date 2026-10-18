@@ -14,6 +14,7 @@ fastapi
 uvicorn
 streamlit
 python-dotenv
+python-multipart
 pydantic
 # Database
 sqlalchemy
@@ -21,3 +22,4 @@ sqlalchemy
 # Computer Vision & ML
 ultralytics
 supervision
+trackers>=2.6.1,<3

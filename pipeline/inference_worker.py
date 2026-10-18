@@ -27,6 +27,75 @@ MAX_TEMPORAL_GAP_SECONDS = 1.0
 TIMING_HISTORY_SIZE = 120
 
 
+def annotate_source_frame(frame, object_detections, person_detections, inference_shape):
+    """Draw inference-space detections on an original-resolution source frame."""
+    source_height, source_width = frame.shape[:2]
+    inference_height, inference_width = inference_shape[:2]
+    scale_x = source_width / max(1, inference_width)
+    scale_y = source_height / max(1, inference_height)
+    scale = min(scale_x, scale_y)
+    thickness = max(2, round(scale * 2))
+    font_scale = max(0.55, min(1.0, 0.55 * scale))
+    annotated = frame.copy()
+
+    detections = [
+        (detection, (40, 190, 240))
+        for detection in object_detections
+    ] + [
+        (detection, (50, 210, 70))
+        for detection in person_detections
+    ]
+    for detection, color in detections:
+        box = detection.get("bbox")
+        if box is None or len(box) != 4:
+            continue
+        x1 = int(round(box[0] * scale_x))
+        y1 = int(round(box[1] * scale_y))
+        x2 = int(round(box[2] * scale_x))
+        y2 = int(round(box[3] * scale_y))
+        x1 = min(max(x1, 0), source_width - 1)
+        y1 = min(max(y1, 0), source_height - 1)
+        x2 = min(max(x2, 0), source_width - 1)
+        y2 = min(max(y2, 0), source_height - 1)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        label = str(detection.get("class", "Object"))
+        confidence = detection.get("confidence")
+        if isinstance(confidence, (int, float)):
+            label += f" {confidence:.0%}"
+        track_id = detection.get("track_id")
+        if track_id is not None and track_id >= 0:
+            label += f"  ID {track_id}"
+
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
+        (label_width, label_height), baseline = cv2.getTextSize(
+            label,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            thickness,
+        )
+        label_top = max(0, y1 - label_height - baseline - 8)
+        cv2.rectangle(
+            annotated,
+            (x1, label_top),
+            (min(source_width - 1, x1 + label_width + 8), y1),
+            (24, 30, 36),
+            cv2.FILLED,
+        )
+        cv2.putText(
+            annotated,
+            label,
+            (x1 + 4, max(label_height, y1 - baseline - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+    return annotated
+
+
 def prepare_frame(frame: np.ndarray, max_width: int = MAX_INFERENCE_WIDTH):
     """Resize wide frames before CPU inference while preserving aspect ratio."""
     height, width = frame.shape[:2]
@@ -81,6 +150,9 @@ class InferenceWorker:
             "timings_ms": {},
             "timing_summary_ms": {},
             "timing_history": deque(maxlen=TIMING_HISTORY_SIZE),
+            "capture_resolution": None,
+            "inference_resolution": None,
+            "recent_detections": deque(maxlen=100),
             "state_data": {},
             "threat_messages": [],
             "performance_history": deque(maxlen=300),
@@ -135,6 +207,7 @@ class InferenceWorker:
             values["timing_summary_ms"] = copy.deepcopy(
                 values["timing_summary_ms"]
             )
+            values["recent_detections"] = list(values["recent_detections"])
             return values
 
     def stop(self, timeout=2.0):
@@ -188,18 +261,34 @@ class InferenceWorker:
                         self._snapshot["error"] = (
                             f"{previous_error}; " if previous_error else ""
                         ) + f"MediaPipe shutdown failed: {exc}"
+            stop_capture = getattr(self.capture, "stop", None)
+            if callable(stop_capture):
+                try:
+                    if not stop_capture():
+                        logger.error(
+                            "Capture source %s did not stop after its "
+                            "inference worker exited.",
+                            self.source_name,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Could not stop capture source %s after its "
+                        "inference worker exited.",
+                        self.source_name,
+                    )
 
     def _run_loop(self):
-        try:
-            self.pose_estimator = MediaPipeEstimator()
-        except Exception as exc:
-            self.pose_estimator = None
-            self.pose_error = str(exc)
-            logger.exception(
-                "MediaPipe initialization failed for %s; continuing "
-                "without pose/action inference.",
-                self.source_name,
-            )
+        if self.runtime.get("lstm_model") is not None:
+            try:
+                self.pose_estimator = MediaPipeEstimator()
+            except Exception as exc:
+                self.pose_estimator = None
+                self.pose_error = str(exc)
+                logger.exception(
+                    "MediaPipe initialization failed for %s; continuing "
+                    "without pose/action inference.",
+                    self.source_name,
+                )
         while not self._stop_event.is_set():
             result = self.capture.read(self._last_sequence)
             if result is None:
@@ -212,6 +301,8 @@ class InferenceWorker:
             self._last_sequence = sequence
             if captured_at is None:
                 continue
+            source_frame = frame
+            capture_resolution = (frame.shape[1], frame.shape[0])
 
             dt = 0.05
             if self._last_captured_at is not None:
@@ -228,6 +319,7 @@ class InferenceWorker:
             inference_started = time.perf_counter()
             preprocess_started = time.perf_counter()
             frame = prepare_frame(frame)
+            inference_resolution = (frame.shape[1], frame.shape[0])
             preprocess_ms = (time.perf_counter() - preprocess_started) * 1000
             with self._settings_lock:
                 settings = dict(self._settings)
@@ -255,6 +347,7 @@ class InferenceWorker:
                         self._person_history,
                         state_data=self._state_data,
                         dt=dt,
+                        timestamp=captured_at,
                         source_name=self.source_name,
                         confidence_threshold=settings[
                             "confidence_threshold"
@@ -273,6 +366,18 @@ class InferenceWorker:
                     self._snapshot["error"] = str(exc)
                 continue
 
+            self._state_data["object_detections"] = list(
+                self._state_data.get("object_detections", [])
+            )
+            overlay_started = time.perf_counter()
+            if source_frame.shape[:2] != frame.shape[:2]:
+                processed_frame = annotate_source_frame(
+                    source_frame,
+                    self._state_data.get("object_detections", []),
+                    self._state_data.get("person_detections", []),
+                    frame.shape,
+                )
+            overlay_ms = (time.perf_counter() - overlay_started) * 1000
             completed_at = time.perf_counter()
             processing_ms = (completed_at - inference_started) * 1000
             frame_latency_ms = max(0.0, (completed_at - captured_at) * 1000)
@@ -280,6 +385,7 @@ class InferenceWorker:
                 self._state_data.get("timings_ms", {})
             )
             stage_timings["preprocess"] = preprocess_ms
+            stage_timings["render_overlay"] = overlay_ms
             stage_timings["total_processing"] = processing_ms
             if self._last_inference_at is None:
                 inference_fps = 0.0
@@ -295,9 +401,20 @@ class InferenceWorker:
                     else 0.8 * previous_fps + 0.2 * instant_fps
                 )
             self._last_inference_at = completed_at
-            self._state_data["object_detections"] = list(
-                self._state_data.get("object_detections", [])
-            )
+
+            detection_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            recent_detections = [
+                {
+                    "timestamp": detection_time,
+                    "class": detection.get("class", "Unknown"),
+                    "confidence": detection.get("confidence"),
+                    "track_id": detection.get("track_id"),
+                }
+                for detection in (
+                    self._state_data.get("object_detections", [])
+                    + self._state_data.get("person_detections", [])
+                )
+            ]
 
             with self._snapshot_lock:
                 history = self._snapshot["performance_history"]
@@ -308,6 +425,8 @@ class InferenceWorker:
                 })
                 timing_history = self._snapshot["timing_history"]
                 timing_history.append(stage_timings)
+                detection_history = self._snapshot["recent_detections"]
+                detection_history.extend(recent_detections)
                 self._snapshot.update({
                     "last_processed_frame": processed_frame,
                     "last_processed_sequence": sequence,
@@ -326,6 +445,9 @@ class InferenceWorker:
                     "timing_summary_ms": self._summarize_timings(
                         timing_history
                     ),
+                    "capture_resolution": capture_resolution,
+                    "inference_resolution": inference_resolution,
+                    "recent_detections": detection_history,
                     "state_data": copy.deepcopy(self._state_data),
                     "threat_messages": list(threat_messages or []),
                     "performance_history": history,
