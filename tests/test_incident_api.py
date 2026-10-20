@@ -75,6 +75,25 @@ def threat_payload(idempotency_key="test-event-key"):
     }
 
 
+def ready_notification_policy():
+    return {
+        "transport_status": "ready",
+        "transport_error": None,
+        "notification_configuration_enabled": True,
+        "custom_model_loaded": True,
+        "model_validation_passed": True,
+        "running_model_validation_passed": True,
+        "production_alerts_approved": True,
+        "running_production_alerts_approved": True,
+        "automatic_alerts_approved": True,
+        "automatic_alerts_enabled": True,
+        "blocked_reason": None,
+        "blocked_status": None,
+        "validation_failures": [],
+        "model_runtime_reason": None,
+    }
+
+
 class IncidentEndpointTests(unittest.TestCase):
     def test_existing_sqlite_incident_table_gets_idempotency_column(self):
         engine = create_engine(
@@ -196,6 +215,11 @@ class IncidentEndpointTests(unittest.TestCase):
                 patch.object(settings, "ALERTS_ENABLED", True),
                 patch.object(settings, "NTFY_TOPIC", "unit-test-topic"),
                 patch(
+                    "server.main._notification_policy",
+                    return_value=ready_notification_policy(),
+                ),
+                patch("server.main.process_notifications"),
+                patch(
                     "server.main.ntfy_service.send_ntfy_notification"
                 ) as send_notification,
             ):
@@ -257,6 +281,11 @@ class IncidentEndpointTests(unittest.TestCase):
                 patch.object(settings, "ALERTS_ENABLED", True),
                 patch.object(settings, "NTFY_TOPIC", "unit-test-topic"),
                 patch(
+                    "server.main._notification_policy",
+                    return_value=ready_notification_policy(),
+                ),
+                patch("server.main.process_notifications"),
+                patch(
                     "server.main.ntfy_service.send_ntfy_notification",
                     side_effect=NtfyDeliveryError("ntfy returned HTTP 503."),
                 ),
@@ -289,6 +318,11 @@ class IncidentEndpointTests(unittest.TestCase):
                 patch.object(settings, "ALERTS_ENABLED", True),
                 patch.object(settings, "NTFY_TOPIC", "unit-test-topic"),
                 patch(
+                    "server.main._notification_policy",
+                    return_value=ready_notification_policy(),
+                ),
+                patch("server.main.process_notifications"),
+                patch(
                     "server.main.ntfy_service.send_ntfy_notification"
                 ) as send_notification,
             ):
@@ -301,11 +335,14 @@ class IncidentEndpointTests(unittest.TestCase):
                 self.assertFalse(response.json()["notification_authorized"])
                 self.assertEqual(
                     response.json()["notification_status"],
-                    "disabled",
+                    "blocked_operator_approval",
                 )
                 history = client.get("/api/v1/incidents").json()
                 self.assertEqual(len(history), 1)
-                self.assertEqual(history[0]["notification_status"], "disabled")
+                self.assertEqual(
+                    history[0]["notification_status"],
+                    "blocked_operator_approval",
+                )
                 send_notification.assert_not_called()
         finally:
             engine.dispose()
@@ -317,6 +354,11 @@ class IncidentEndpointTests(unittest.TestCase):
                 client_for_engine(engine) as (client, _),
                 patch.object(settings, "ALERTS_ENABLED", True),
                 patch.object(settings, "NTFY_TOPIC", "unit-test-topic"),
+                patch(
+                    "server.main._notification_policy",
+                    return_value=ready_notification_policy(),
+                ),
+                patch("server.main.process_notifications"),
                 patch(
                     "server.main.ntfy_service.send_ntfy_notification"
                 ) as send_notification,
@@ -395,6 +437,104 @@ class IncidentEndpointTests(unittest.TestCase):
                 send_notification.assert_called_once()
         finally:
             engine.dispose()
+
+    def test_blocked_incidents_are_saved_with_specific_notification_reasons(self):
+        blocked_policies = (
+            ("blocked_validation", "Detector validation failed."),
+            ("blocked_operator_approval", "Operator approval is missing."),
+            ("blocked_configuration", "Notification configuration is disabled."),
+        )
+        for status, reason in blocked_policies:
+            engine = create_test_engine()
+            policy = ready_notification_policy()
+            policy.update({
+                "automatic_alerts_enabled": False,
+                "blocked_status": status,
+                "blocked_reason": reason,
+            })
+            try:
+                with (
+                    client_for_engine(engine) as (client, _),
+                    patch("server.main._notification_policy", return_value=policy),
+                    patch(
+                        "server.main.ntfy_service.send_ntfy_notification"
+                    ) as send_notification,
+                ):
+                    response = client.post(
+                        "/api/v1/incidents",
+                        data={"incident_data": json.dumps(threat_payload())},
+                        files={"_multipart": ("", b"", "text/plain")},
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(response.json()["notification_status"], status)
+                    self.assertEqual(response.json()["notification_error"], reason)
+
+                    history = client.get("/api/v1/incidents").json()
+                    self.assertEqual(len(history), 1)
+                    self.assertEqual(history[0]["notification_status"], status)
+                    self.assertEqual(history[0]["notification_error"], reason)
+                    send_notification.assert_not_called()
+            finally:
+                engine.dispose()
+
+    def test_notification_status_reports_separate_gates(self):
+        engine = create_test_engine()
+        policy = ready_notification_policy()
+        policy.update({
+            "notification_configuration_enabled": False,
+            "automatic_alerts_enabled": False,
+            "blocked_reason": "Phone notifications are disabled.",
+            "blocked_status": "blocked_configuration",
+        })
+        try:
+            with (
+                client_for_engine(engine) as (client, _),
+                patch("server.main._notification_policy", return_value=policy),
+            ):
+                response = client.get("/api/v1/notifications/status")
+
+            self.assertEqual(response.status_code, 200)
+            status = response.json()
+            self.assertTrue(status["custom_model_loaded"])
+            self.assertTrue(status["model_validation_passed"])
+            self.assertTrue(status["production_alerts_approved"])
+            self.assertFalse(status["notification_configuration_enabled"])
+            self.assertFalse(status["automatic_alerts_enabled"])
+            self.assertEqual(
+                status["blocked_reason"],
+                "Phone notifications are disabled.",
+            )
+        finally:
+            engine.dispose()
+
+    def test_disabled_notification_configuration_blocks_automatic_policy(self):
+        validation = {
+            "passed": True,
+            "failures": [],
+            "production_alerts_approved": True,
+            "production_alerts_approval_invalid": False,
+            "record": {"checkpoint_sha256": "test-digest"},
+        }
+        runtime = {
+            "loaded": True,
+            "status": {
+                "model_validation_passed": True,
+                "production_alerts_approved": True,
+            },
+        }
+        with (
+            patch("server.main._detector_validation_status", return_value=validation),
+            patch("server.main.read_detector_status", return_value=runtime),
+            patch("server.main.ntfy_service.notification_state", return_value=("ready", None)),
+            patch.object(settings, "ALERTS_ENABLED", False),
+            patch("server.main.AUTO_ALERTS_APPROVED", True),
+            patch("server.main.ALERT_ENDPOINT_VERIFIED", True),
+        ):
+            policy = main._notification_policy()
+
+        self.assertFalse(policy["notification_configuration_enabled"])
+        self.assertFalse(policy["automatic_alerts_enabled"])
+        self.assertEqual(policy["blocked_status"], "blocked_configuration")
 
     def test_incident_history_survives_database_reopen(self):
         with tempfile.TemporaryDirectory() as directory:

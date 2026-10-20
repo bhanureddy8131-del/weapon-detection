@@ -1,7 +1,11 @@
 import unittest
 from unittest.mock import Mock, patch
 
+import pyarrow as pa
+from streamlit.testing.v1 import AppTest
+
 from pipeline.app import (
+    build_validation_acceptance_table,
     build_recent_detection_table,
     fetch_incident_summary,
     fetch_incidents,
@@ -31,6 +35,75 @@ class DashboardIncidentTests(unittest.TestCase):
         table = build_recent_detection_table({"class": "gun"})
 
         self.assertTrue(table.empty)
+
+    def test_acceptance_table_formats_class_list_and_is_arrow_compatible(self):
+        table = build_validation_acceptance_table({
+            "representative_tests_complete": {
+                "passed": True,
+                "actual": ["atm", "backpack", "gun", "handbag", "knife", "person"],
+                "expected": ["atm", "backpack", "gun", "handbag", "knife", "person"],
+            },
+            "precision": {
+                "passed": False,
+                "actual": 0.1214,
+                "minimum": 0.7,
+            },
+        })
+
+        expected_classes = "atm, backpack, gun, handbag, knife, person"
+        self.assertEqual(table.iloc[0]["Actual"], expected_classes)
+        self.assertEqual(table.iloc[0]["Required"], expected_classes)
+        self.assertEqual(table.iloc[1]["Actual"], "0.1214")
+        self.assertEqual(str(table["Actual"].dtype), "string")
+        self.assertEqual(str(table["Required"].dtype), "string")
+
+        arrow_table = pa.Table.from_pandas(table, preserve_index=False)
+        self.assertEqual(arrow_table.num_rows, 2)
+
+        app = AppTest.from_string(
+            "import pandas as pd\n"
+            "import streamlit as st\n"
+            "st.dataframe(pd.DataFrame(" + repr(table.to_dict("records")) + "))"
+        )
+        app.run()
+        self.assertFalse(app.exception)
+        self.assertEqual(len(app.dataframe), 1)
+
+    def test_acceptance_table_handles_empty_checks_and_missing_values(self):
+        empty = build_validation_acceptance_table({})
+        self.assertTrue(empty.empty)
+        self.assertEqual(str(empty["Actual"].dtype), "string")
+        self.assertEqual(str(empty["Passed"].dtype), "bool")
+        pa.Table.from_pandas(empty, preserve_index=False)
+
+        table = build_validation_acceptance_table({
+            "missing_actual": {"passed": False},
+        })
+        self.assertEqual(table.iloc[0]["Actual"], "Unavailable")
+        self.assertEqual(table.iloc[0]["Required"], "Unavailable")
+        pa.Table.from_pandas(table, preserve_index=False)
+
+    def test_detection_size_widget_preserves_session_state_on_rerun(self):
+        app = AppTest.from_string(
+            "from types import SimpleNamespace\n"
+            "from pipeline.app import render_detection_settings\n"
+            "runtime = {\n"
+            "    'detector': SimpleNamespace(\n"
+            "        class_names={0: 'atm', 1: 'backpack', 2: 'gun', "
+            "3: 'handbag', 4: 'knife', 5: 'person'},\n"
+            "        is_custom_model=True,\n"
+            "    ),\n"
+            "    'threat_manager': SimpleNamespace(log_cooldown=30.0),\n"
+            "}\n"
+            "render_detection_settings(runtime)\n"
+        ).run(timeout=30)
+        self.assertFalse(app.exception)
+        self.assertEqual(app.session_state["smartvision_yolo_input_size"], 320)
+
+        app.session_state["smartvision_yolo_input_size"] = 640
+        app.run(timeout=30)
+        self.assertFalse(app.exception)
+        self.assertEqual(app.session_state["smartvision_yolo_input_size"], 640)
 
     def test_summary_fetch_uses_incident_summary_url_and_validates_shape(self):
         response = Mock(status_code=200)

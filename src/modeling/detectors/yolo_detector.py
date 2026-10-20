@@ -1,5 +1,3 @@
-import hashlib
-import json
 import logging
 from pathlib import Path
 
@@ -7,230 +5,383 @@ import torch
 from ultralytics import YOLO
 
 from src.config import EXPECTED_DETECTOR_CLASSES, ROOT_DIR
+from src.modeling.detectors.runtime_status import publish_detector_status
+from src.modeling.detectors.validation import (
+    sha256_file,
+    validate_validation_record,
+)
 from src.utils.base_detector import BaseDetector
+
 
 logger = logging.getLogger(__name__)
 
 
 class YOLODetector(BaseDetector):
+    """
+    SmartVision Pro YOLO detector.
+
+    Safety behavior:
+    - Uses the configured custom checkpoint when available.
+    - Falls back to generic YOLO only for inference continuity.
+    - Never treats generic YOLO weights as a validated weapon detector.
+    - Enables production alerts only when the custom weights have a
+      matching validation record and explicit operator approval.
+    """
+
+    MINIMUM_CHECKPOINT_SIZE = 10_000
+
     def __init__(self):
         self.model = None
         self.class_names = None
+
         self.requested_model_path = None
         self.model_path = None
+        self.loaded_checkpoint_sha256 = None
+
         self.is_custom_model = False
         self.is_validated = False
+        self.production_alerts_approved = False
         self.alerts_enabled = False
-        self.model_diagnostic = "Model has not been loaded."
-        self.loaded_class_map = {}
         self.weapon_detection_available = False
+
+        self.loaded_class_map = {}
+        self.model_diagnostic = "Model has not been loaded."
+        self.validation_status = {
+            "passed": False,
+            "failures": ["Model has not been loaded."],
+        }
+
         print("YOLODetector initialized.")
 
+    @staticmethod
+    def _checkpoint_is_available(path):
+        """Return whether a checkpoint exists and is not suspiciously small."""
+        try:
+            return (
+                path.is_file()
+                and path.stat().st_size >= YOLODetector.MINIMUM_CHECKPOINT_SIZE
+            )
+        except OSError:
+            return False
+
+    @staticmethod
+    def _get_class_map(model_names):
+        """Normalize YOLO class names to a dictionary of integer IDs."""
+        if isinstance(model_names, dict):
+            return {
+                int(class_id): str(name).strip()
+                for class_id, name in model_names.items()
+            }
+
+        if isinstance(model_names, (list, tuple)):
+            return {
+                class_id: str(name).strip()
+                for class_id, name in enumerate(model_names)
+            }
+
+        return {}
+
+    def _load_validation_record(self):
+        """
+        Verify the validation record belonging to the requested checkpoint.
+
+        A record must match the exact checkpoint and contain the expected
+        classes, validation metrics, representative tests, and completion
+        flags. A record alone does not prove real-world detector accuracy.
+        """
+        if self.requested_model_path is None:
+            self.validation_status = {
+                "passed": False,
+                "failures": ["No custom checkpoint was requested."],
+            }
+            return {}
+
+        self.validation_status = validate_validation_record(
+            self.requested_model_path
+        )
+        self.is_validated = self.validation_status["passed"]
+        if not self.is_validated:
+            logger.warning(
+                "Custom detector validation failed for %s: %s",
+                self.requested_model_path,
+                "; ".join(self.validation_status["failures"]),
+            )
+        return self.validation_status["record"]
+
     def load_model(self, model_path):
-        root_dir = Path(ROOT_DIR)
-        requested_path = Path(model_path)
+        """Load custom YOLO weights or use a clearly identified fallback."""
+        root_dir = Path(ROOT_DIR).resolve()
+        requested_path = Path(model_path).expanduser()
 
         if not requested_path.is_absolute():
             requested_path = root_dir / requested_path
 
+        requested_path = requested_path.resolve()
         self.requested_model_path = requested_path
-        fallback_path = root_dir / "yolo11s.pt"
+
+        fallback_path = (root_dir / "yolo11s.pt").resolve()
+
+        self.model = None
+        self.class_names = None
+        self.model_path = None
+        self.loaded_checkpoint_sha256 = None
+
+        self.is_custom_model = False
+        self.is_validated = False
+        self.production_alerts_approved = False
+        self.alerts_enabled = False
+        self.weapon_detection_available = False
+
+        self.loaded_class_map = {}
+        self.model_diagnostic = ""
+        self.validation_status = {
+            "passed": False,
+            "failures": ["Custom checkpoint is not loaded."],
+        }
+        publish_detector_status(self)
+
         load_fallback = False
         fallback_reason = None
 
-        if (
-            not requested_path.is_file()
-            or requested_path.stat().st_size < 10000
-        ):
+        # -------------------------------------------------------------
+        # CHECK CONFIGURED CHECKPOINT
+        # -------------------------------------------------------------
+        if not self._checkpoint_is_available(requested_path):
             fallback_reason = (
-                "Configured detector checkpoint is missing or too small: "
+                "The configured custom detector checkpoint is missing "
+                "or too small: "
                 f"{requested_path}"
             )
 
-            if not fallback_path.is_file():
-                raise FileNotFoundError(
-                    f"{fallback_reason}. No fallback checkpoint exists at "
-                    f"{fallback_path}. Install valid trained weights or set "
-                    "SMARTVISION_YOLO_MODEL_PATH."
+            if not self._checkpoint_is_available(fallback_path):
+                self.model_diagnostic = (
+                    f"{fallback_reason}. The generic fallback is also "
+                    f"unavailable: {fallback_path}. Restore a valid "
+                    "checkpoint before running inference."
                 )
 
+                logger.error(self.model_diagnostic)
+                publish_detector_status(self)
+
+                raise FileNotFoundError(self.model_diagnostic)
+
             logger.warning(
-                "%s. Loading general-purpose fallback %s; it is not a "
-                "weapon detector.",
+                "%s. Loading generic YOLO for inference continuity. "
+                "The fallback is not a validated SmartVision weapon detector.",
                 fallback_reason,
-                fallback_path,
             )
+
             requested_path = fallback_path
             load_fallback = True
 
-        logger.info("Loading YOLO checkpoint: %s", requested_path)
-
-        custom_load_error = None
+        # -------------------------------------------------------------
+        # LOAD MODEL
+        # -------------------------------------------------------------
         try:
+            logger.info("Loading YOLO checkpoint: %s", requested_path)
             model = YOLO(str(requested_path))
+
         except Exception as exc:
-            if requested_path.resolve() == fallback_path.resolve():
-                raise RuntimeError(
-                    f"The fallback YOLO checkpoint could not be loaded: "
+            if load_fallback:
+                self.model_diagnostic = (
+                    f"Unable to load the generic fallback checkpoint "
                     f"{fallback_path}: {exc}"
-                ) from exc
-            custom_load_error = str(exc)
-            fallback_reason = (
-                "Configured detector checkpoint could not be loaded: "
-                f"{self.requested_model_path}: {custom_load_error}"
-            )
-            if not fallback_path.is_file():
-                raise RuntimeError(
-                    f"The configured YOLO checkpoint could not be loaded: "
-                    f"{requested_path}: {exc}. No fallback checkpoint exists "
-                    f"at {fallback_path}. Supply valid custom weights or "
-                    "restore the root yolo11s.pt fallback."
-                ) from exc
+                )
+                logger.exception(self.model_diagnostic)
+                publish_detector_status(self)
+                raise RuntimeError(self.model_diagnostic) from exc
+
             logger.exception(
-                "%s. Loading general-purpose fallback %s; it is not a "
-                "weapon detector.",
-                fallback_reason,
-                fallback_path,
+                "Unable to load the configured custom checkpoint: %s",
+                requested_path,
             )
-            requested_path = fallback_path
-            load_fallback = True
+
+            if not self._checkpoint_is_available(fallback_path):
+                self.model_diagnostic = (
+                    f"Custom checkpoint could not be loaded: {exc}. "
+                    f"Generic fallback is unavailable: {fallback_path}"
+                )
+                publish_detector_status(self)
+                raise RuntimeError(self.model_diagnostic) from exc
+
+            fallback_reason = (
+                f"Custom checkpoint could not be loaded: "
+                f"{self.requested_model_path}. Error: {exc}"
+            )
+
+            logger.warning(
+                "%s. Loading generic YOLO for inference continuity.",
+                fallback_reason,
+            )
+
             try:
-                model = YOLO(str(requested_path))
+                model = YOLO(str(fallback_path))
+                requested_path = fallback_path
+                load_fallback = True
+
             except Exception as fallback_exc:
-                raise RuntimeError(
-                    f"Neither configured YOLO checkpoint "
-                    f"{self.requested_model_path} nor fallback checkpoint "
-                    f"{fallback_path} could be loaded. Custom error: "
-                    f"{custom_load_error}; fallback error: {fallback_exc}"
-                ) from fallback_exc
+                self.model_diagnostic = (
+                    "Both the custom checkpoint and generic fallback failed "
+                    "to load. "
+                    f"Custom error: {exc}. Fallback error: {fallback_exc}"
+                )
+                logger.exception(self.model_diagnostic)
+                publish_detector_status(self)
+                raise RuntimeError(self.model_diagnostic) from fallback_exc
+
         self.model = model
         self.class_names = model.names
         self.model_path = requested_path
-        model_names: object = model.names
-        if isinstance(model_names, dict):
-            self.loaded_class_map = {
-                int(class_id): str(name).strip()
-                for class_id, name in model_names.items()
-            }
-            loaded_names = tuple(
-                name.lower()
-                for _, name in sorted(self.loaded_class_map.items())
-            )
-        elif isinstance(model_names, (list, tuple)):
-            self.loaded_class_map = {
-                class_id: str(name).strip()
-                for class_id, name in enumerate(model_names)
-            }
-            loaded_names = tuple(
-                name.lower()
-                for name in self.loaded_class_map.values()
-            )
-        else:
-            self.loaded_class_map = {}
-            loaded_names = ()
-        self.is_custom_model = (
-            requested_path.resolve() == self.requested_model_path.resolve()
+        if not load_fallback and requested_path == self.requested_model_path:
+            try:
+                self.loaded_checkpoint_sha256 = sha256_file(requested_path)
+            except OSError:
+                logger.exception(
+                    "Could not hash the loaded custom detector checkpoint: %s",
+                    requested_path,
+                )
+
+        # -------------------------------------------------------------
+        # READ MODEL CLASS NAMES
+        # -------------------------------------------------------------
+        self.loaded_class_map = self._get_class_map(model.names)
+
+        loaded_names = tuple(
+            name.lower()
+            for _, name in sorted(self.loaded_class_map.items())
+        )
+
+        # A generic fallback must never qualify as the requested custom
+        # detector, even if a model happens to contain similarly named
+        # classes.
+        self.is_custom_model = bool(
+            not load_fallback
+            and requested_path == self.requested_model_path
             and loaded_names == EXPECTED_DETECTOR_CLASSES
         )
+
         self.weapon_detection_available = bool(
             self.is_custom_model
             and {"gun", "knife"}.issubset(set(loaded_names))
         )
+
+        # -------------------------------------------------------------
+        # VALIDATE CUSTOM DETECTOR
+        # -------------------------------------------------------------
         if self.is_custom_model:
-            metadata_path = self.requested_model_path.with_suffix(
-                self.requested_model_path.suffix + ".validation.json"
+            self._load_validation_record()
+            self.production_alerts_approved = bool(
+                self.validation_status["production_alerts_approved"]
             )
-            validation = {}
-            try:
-                validation = json.loads(
-                    metadata_path.read_text(encoding="utf-8")
-                )
-                if not isinstance(validation, dict):
-                    raise ValueError("Validation record must be a JSON object.")
-                digest = hashlib.sha256()
-                with self.requested_model_path.open("rb") as weights_file:
-                    for chunk in iter(
-                        lambda: weights_file.read(1024 * 1024),
-                        b"",
-                    ):
-                        digest.update(chunk)
-                self.is_validated = (
-                    validation.get("classes") == list(EXPECTED_DETECTOR_CLASSES)
-                    and validation.get("weights_sha256") == digest.hexdigest()
-                    and validation.get("validation_completed") is True
-                    and isinstance(validation.get("validation_metrics"), dict)
-                    and isinstance(validation.get("validation_summary"), dict)
-                    and all(
-                        isinstance(
-                            validation["validation_summary"].get(metric),
-                            (int, float),
-                        )
-                        for metric in ("precision", "recall", "map50", "map50_95")
-                    )
-                    and validation.get("representative_validation_completed")
-                    is True
-                )
-            except (OSError, ValueError, TypeError):
-                self.is_validated = False
-            self.alerts_enabled = (
+
+            self.alerts_enabled = bool(
                 self.is_validated
-                and validation.get("production_alerts_approved") is True
+                and self.production_alerts_approved
             )
-            self.model_diagnostic = (
-                "Validated six-class SmartVision detector loaded; production "
-                "alerts are enabled."
-                if self.alerts_enabled
-                else (
-                    "Six-class detector weights loaded. Production alerts "
-                    "remain disabled until validation is complete and an "
-                    "operator approves the validation record."
-                    if self.is_validated
-                    else (
-                        "Six-class detector weights loaded, but a matching "
-                        "validation record with metrics and representative "
-                        "image tests was not found. Production alerts remain "
-                        "disabled."
+
+            if self.alerts_enabled:
+                self.model_diagnostic = (
+                    "Custom six-class detector loaded. A matching validation "
+                    "record and explicit production-alert approval were found. "
+                    "Check the live configuration before sending notifications."
+                )
+
+            elif self.is_validated:
+                self.model_diagnostic = (
+                    "Custom six-class detector loaded and its validation "
+                    "record matches the checkpoint. Production alerts remain "
+                    "disabled because explicit operator approval is absent."
+                )
+
+            else:
+                failures = self.validation_status.get("failures", [])
+                self.model_diagnostic = (
+                    "Custom six-class detector loaded, but a valid matching "
+                    "validation record was not found. Production alerts remain "
+                    "disabled until validation and representative image tests "
+                    "pass. "
+                    + (
+                        "Validation blockers: " + "; ".join(failures)
+                        if failures
+                        else ""
                     )
                 )
-            )
+
         else:
             missing_names = sorted(
                 set(EXPECTED_DETECTOR_CLASSES) - set(loaded_names)
             )
-            self.model_diagnostic = (
-                "Active weights are not the configured six-class weapon "
-                "detector. "
-                "Missing project classes: "
-                f"{', '.join(missing_names) if missing_names else 'class order mismatch'}."
-            )
-        if load_fallback:
-            self.model_diagnostic = (
-                f"{fallback_reason}. Active checkpoint: {requested_path}. "
-                "The general-purpose COCO fallback has no gun, pistol, "
-                "rifle, or project-trained weapon class; its generic knife "
-                "class is not counted as a validated weapon. "
-                + self.model_diagnostic
-            )
+
+            if load_fallback:
+                self.model_diagnostic = (
+                    f"{fallback_reason or 'Custom checkpoint unavailable'}. "
+                    f"Active checkpoint: {requested_path}. "
+                    "This is a generic YOLO fallback, not a validated "
+                    "SmartVision weapon detector. "
+                    f"Missing project classes: "
+                    f"{', '.join(missing_names) if missing_names else 'custom class mapping'}. "
+                    "Production alerts remain disabled."
+                )
+            else:
+                self.model_diagnostic = (
+                    "The loaded checkpoint does not match the expected "
+                    "SmartVision six-class detector. "
+                    f"Missing project classes: "
+                    f"{', '.join(missing_names) if missing_names else 'class order mismatch'}. "
+                    "Production alerts remain disabled."
+                )
+
+        # -------------------------------------------------------------
+        # FINAL SAFETY CHECK
+        # -------------------------------------------------------------
+        if not self.is_custom_model:
+            self.is_validated = False
+            self.alerts_enabled = False
+
+        if not self.weapon_detection_available:
+            self.alerts_enabled = False
+
+        publish_detector_status(self)
 
         logger.info(
-            "Loaded YOLO checkpoint %s with class map: %s",
+            "Loaded YOLO checkpoint: %s",
             self.model_path,
+        )
+
+        logger.info(
+            "YOLO class map: %s",
             ", ".join(
                 f"{class_id}={class_name}"
                 for class_id, class_name in self.loaded_class_map.items()
             ),
         )
+
+        logger.info(
+            "Custom model: %s | Validated: %s | Weapon classes available: %s "
+            "| Production alerts approved: %s",
+            self.is_custom_model,
+            self.is_validated,
+            self.weapon_detection_available,
+            self.alerts_enabled,
+        )
+
         if not self.weapon_detection_available:
             logger.error(
-                "Weapon detection unavailable: %s",
+                "Custom weapon detection is unavailable: %s",
                 self.model_diagnostic,
             )
 
+        return self.model
+
     def predict(self, frame, conf=0.5, imgsz=640, iou=0.7):
+        """Run YOLO inference on an image or video frame."""
         if self.model is None:
             raise RuntimeError(
-                "Model has not been loaded. Call load_model() first."
+                "YOLO model has not been loaded. Call load_model() first."
             )
+
+        if frame is None:
+            raise ValueError("Cannot run YOLO inference on an empty frame.")
 
         with torch.inference_mode():
             return self.model.predict(

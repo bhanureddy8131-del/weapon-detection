@@ -5,6 +5,15 @@ from dotenv import load_dotenv
 # --- PROJECT SETUP ---
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(ROOT_DIR, ".env"))
+_VALIDATION_DATA_PATH = os.getenv(
+    "SMARTVISION_VALIDATION_DATA",
+    os.path.join(ROOT_DIR, "The_final-4", "data.yaml"),
+)
+if not os.path.isabs(_VALIDATION_DATA_PATH):
+    _VALIDATION_DATA_PATH = os.path.join(ROOT_DIR, _VALIDATION_DATA_PATH)
+VALIDATION_DATA_PATH = os.path.abspath(
+    os.path.expanduser(_VALIDATION_DATA_PATH)
+)
 
 # --- PATHS ---
 YOLO_MODEL_PATH = os.getenv(
@@ -61,6 +70,7 @@ EXPECTED_DETECTOR_CLASSES = (
     "knife",
     "person",
 )
+YOLO_LABEL_BOUNDARY_TOLERANCE = 1e-6
 ACTION_CONFIDENCE_THRESHOLD = float(
     os.getenv("SMARTVISION_ACTION_CONFIDENCE_THRESHOLD", "0.85")
 )

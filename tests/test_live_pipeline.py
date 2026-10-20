@@ -352,25 +352,46 @@ class LivePipelineTests(unittest.TestCase):
         self.assertEqual(summary["bytetrack"]["mean"], 4.0)
 
     def test_polygon_annotation_converts_to_axis_aligned_yolo_box(self):
-        row, converted = _convert_label_row(
+        row, converted, clipped = _convert_label_row(
             "2 0.2 0.3 0.8 0.3 0.8 0.7 0.2 0.7",
             Path("sample.txt"),
             class_count=6,
         )
         self.assertTrue(converted)
+        self.assertFalse(clipped)
         self.assertEqual(row, "2 0.50000000 0.50000000 0.60000000 0.40000000")
 
     def test_box_annotation_is_preserved_and_invalid_class_rejected(self):
-        row, converted = _convert_label_row(
+        row, converted, clipped = _convert_label_row(
             "5 0.5 0.5 0.2 0.4",
             Path("sample.txt"),
             class_count=6,
         )
         self.assertFalse(converted)
+        self.assertFalse(clipped)
         self.assertEqual(row, "5 0.50000000 0.50000000 0.20000000 0.40000000")
         with self.assertRaisesRegex(ValueError, "Class id 6"):
             _convert_label_row(
                 "6 0.5 0.5 0.2 0.4",
+                Path("sample.txt"),
+                class_count=6,
+            )
+
+    def test_six_decimal_edge_rounding_is_clipped_only_for_staging(self):
+        row, converted, clipped = _convert_label_row(
+            "5 0.5 0.6000005 0.2 0.8",
+            Path("sample.txt"),
+            class_count=6,
+        )
+        self.assertFalse(converted)
+        self.assertTrue(clipped)
+        self.assertEqual(
+            row,
+            "5 0.50000000 0.60000025 0.20000000 0.79999950",
+        )
+        with self.assertRaisesRegex(ValueError, "outside the image"):
+            _convert_label_row(
+                "5 0.5 0.60001 0.2 0.8",
                 Path("sample.txt"),
                 class_count=6,
             )
@@ -387,7 +408,8 @@ class LivePipelineTests(unittest.TestCase):
                 (image_dir / "sample.jpg").write_bytes(b"test image placeholder")
                 (label_dir / "sample.txt").write_text(
                     "2 0.2 0.3 0.8 0.3 0.8 0.7 0.2 0.7\n"
-                    "5 0.5 0.5 0.2 0.4\n",
+                    "5 0.5 0.5 0.2 0.4\n"
+                    "5 0.5 0.6000005 0.2 0.8\n",
                     encoding="utf-8",
                 )
 
@@ -416,14 +438,22 @@ class LivePipelineTests(unittest.TestCase):
 
             self.assertEqual(counts["linked_images"], 3)
             self.assertEqual(counts["converted_polygon_rows"], 3)
+            self.assertEqual(counts["rounding_boundary_rows"], 3)
             self.assertEqual(
                 (staged_root / "train" / "labels" / "sample.txt").read_text(
                     encoding="utf-8"
                 ).splitlines()[0],
                 "2 0.50000000 0.50000000 0.60000000 0.40000000",
             )
+            staged_rows = (
+                staged_root / "train" / "labels" / "sample.txt"
+            ).read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                staged_rows[2],
+                "5 0.50000000 0.60000025 0.20000000 0.79999950",
+            )
             self.assertIn(
-                "0.2 0.4",
+                "0.6000005 0.2 0.8",
                 (source_root / "train" / "labels" / "sample.txt").read_text(
                     encoding="utf-8"
                 ),
@@ -516,7 +546,7 @@ class LivePipelineTests(unittest.TestCase):
         self.assertTrue(np.all(source == 0))
         self.assertTrue(np.array_equal(annotated[80, 20], [40, 190, 240]))
 
-    def test_custom_detector_requires_operator_approval_for_alerts(self):
+    def test_incomplete_custom_validation_record_never_approves_alerts(self):
         from src.config import EXPECTED_DETECTOR_CLASSES
 
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -556,6 +586,10 @@ class LivePipelineTests(unittest.TestCase):
                     str(root),
                 ),
                 patch(
+                    "src.modeling.detectors.runtime_status.STATUS_PATH",
+                    root / "logs" / "detector_runtime_status.json",
+                ),
+                patch(
                     "src.modeling.detectors.yolo_detector.YOLO",
                     return_value=fake_model,
                 ),
@@ -563,7 +597,7 @@ class LivePipelineTests(unittest.TestCase):
                 detector = YOLODetector()
                 detector.load_model(str(weights_path))
                 self.assertTrue(detector.is_custom_model)
-                self.assertTrue(detector.is_validated)
+                self.assertFalse(detector.is_validated)
                 self.assertFalse(detector.alerts_enabled)
 
                 record["production_alerts_approved"] = True
@@ -573,7 +607,8 @@ class LivePipelineTests(unittest.TestCase):
                 )
                 approved_detector = YOLODetector()
                 approved_detector.load_model(str(weights_path))
-                self.assertTrue(approved_detector.alerts_enabled)
+                self.assertFalse(approved_detector.is_validated)
+                self.assertFalse(approved_detector.alerts_enabled)
 
     def test_corrupt_custom_detector_uses_generic_fallback_with_diagnostic(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -601,8 +636,11 @@ class LivePipelineTests(unittest.TestCase):
             self.assertFalse(detector.is_custom_model)
             self.assertFalse(detector.alerts_enabled)
             self.assertIn("invalid checkpoint", detector.model_diagnostic)
-            self.assertIn("general-purpose COCO fallback", detector.model_diagnostic)
-            self.assertIn("not counted as a validated weapon", detector.model_diagnostic)
+            self.assertIn("generic YOLO fallback", detector.model_diagnostic)
+            self.assertIn(
+                "not a validated SmartVision weapon detector",
+                detector.model_diagnostic,
+            )
 
     def test_missing_custom_checkpoint_marks_generic_fallback_unavailable(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -626,7 +664,10 @@ class LivePipelineTests(unittest.TestCase):
             self.assertEqual(detector.model_path, fallback_path)
             self.assertFalse(detector.weapon_detection_available)
             self.assertIn("checkpoint is missing", detector.model_diagnostic)
-            self.assertIn("no gun, pistol, rifle", detector.model_diagnostic)
+            self.assertIn(
+                "Missing project classes: atm, backpack, gun, handbag",
+                detector.model_diagnostic,
+            )
             self.assertFalse(detector.alerts_enabled)
 
     def test_alert_delivery_reports_success_and_failure_and_deduplicates(self):

@@ -29,6 +29,11 @@ class Config:
     ALERTS_ENABLED = _env_flag("SMARTVISION_ALERTS_ENABLED")
     NTFY_TOPIC = os.getenv("SMARTVISION_NTFY_TOPIC", "").strip()
     NTFY_SERVER = os.getenv("SMARTVISION_NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+    ALERT_APPROVERS = frozenset(
+        value.strip().casefold()
+        for value in os.getenv("SMARTVISION_ALERT_APPROVERS", "").split(",")
+        if value.strip()
+    )
 
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")

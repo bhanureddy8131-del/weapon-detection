@@ -77,18 +77,41 @@ To test a specific image or inference configuration:
 .\.venv\Scripts\python.exe scripts\diagnose.py --image "C:\path\to\sample.jpg" --runs 10 --image-size 416 --confidence 0.10
 ```
 
-The diagnostic does not write model files or incidents. Its timing and detections are runtime observations, not a validation score. If the custom file is absent or unreadable, the app reports and uses the generic `yolo11s.pt` fallback when available. That fallback does not recognize the project's `gun` or `atm` classes; generic COCO `knife` is not treated as a project weapon. Supply a compatible six-class checkpoint at `models/yolo11s_fine_tune_v3.pt` and validate it against `The_final-4/data.yaml` before relying on those classes.
+The diagnostic does not write model files or incidents. Its timing and detections are runtime observations, not a validation score. If the custom file is absent or unreadable, the app reports and uses the generic `yolo11s.pt` fallback when available. That fallback does not recognize the project's `gun` or `atm` classes; generic COCO `knife` is not treated as a project weapon.
+
+Run the separate, real held-out validation operation from the project root after installing the intended custom checkpoint. It loads the checkpoint configured by `SMARTVISION_YOLO_MODEL_PATH` (or the default), requires the exact six-class map, evaluates `The_final-4/data.yaml`'s `val` split, measures precision/recall/mAP and per-class metrics, and tests labeled representative images. It never trains or approves production alerts:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\validate_detector.py
+```
+
+The timestamped report and Ultralytics plots are under `runs\validation\<split>\<timestamp>\`; the latest validation report is `runs\validation\latest\validation_report.json`, the separate final held-out report is `runs\validation\latest\final_test_report.json`, and the log is `logs\detector_validation.log`. A completed evaluation records its exact checkpoint path and SHA-256, dataset YAML hash and image/label manifest, class mapping, evaluation settings, metrics, explicit acceptance checks, and per-image representative results in both the report and checkpoint sidecar. The verifier rechecks dataset identity and evaluation settings, requires all checks to be explicitly present, and reconciles representative per-image counts with their totals. Sidecars expire after 30 days and are invalidated when checkpoint or validation-data identity changes. Defaults require aggregate precision/recall/mAP50 >= 0.70, mAP50-95 >= 0.50, gun/knife/person recall >= 0.70, and zero missed weapons/weapon false positives in representative tests. Metric minima are configurable with `SMARTVISION_VALIDATION_MIN_*` environment settings or corresponding CLI flags; representative limits use `SMARTVISION_VALIDATION_MAX_WEAPON_MISSED_DETECTIONS` and `SMARTVISION_VALIDATION_MAX_WEAPON_FALSE_POSITIVES` (default `0`). CLI options cannot relax the configured limits. A failed or incomplete run is not a valid detector report.
+
+After reviewing a passing report and confirming the ntfy transport and API endpoint, add the authorized Windows account name to the protected environment. The script compares this allowlist with the account returned by `getpass.getuser()`:
+
+```powershell
+$env:SMARTVISION_ALERT_APPROVERS = "<authorized-Windows-account>"
+$env:SMARTVISION_ALERT_ENDPOINT_VERIFIED = "true"
+```
+
+Then explicitly approve the exact checkpoint from that operator account:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\approve_detector_alerts.py --confirm "I reviewed the detector validation report and approve production alerts"
+```
+
+This records the local operator, approval timestamp, checkpoint hash, validation-report hash, and provider test acceptance in the sidecar; it does not enable automatic delivery. Only after the approval command succeeds should the operator separately set `SMARTVISION_AUTO_ALERTS_APPROVED=true` alongside `SMARTVISION_ALERTS_ENABLED=true`, the verified endpoint, and a configured ntfy topic. Restart the inference application after model approval and restart the backend after changing its environment. A successful `/api/v1/notifications/test` only checks ntfy transport and never validates or approves the model.
 
 ### Webcam checklist
 
-1. Start FastAPI and Streamlit using the commands below; open `http://localhost:8501` and select **Model and system health**. Confirm the actual detector, API, LSTM, and alert-delivery states.
+1. Start FastAPI and Streamlit using the commands below; open `http://localhost:8501` and select **System health**. Confirm the actual detector, API, LSTM, and alert-delivery states.
 2. Open **Live detection**, select **Live Webcam**, then select **Start**. Confirm source resolution, inference resolution, capture/inference FPS, latest frame age, and processing latency are updating.
 3. Compare the fresh live image with **Latest annotated inference**. Boxes and labels are drawn on the original-resolution frame; detection rows and KPIs come from inference output. A generic detector may show COCO classes, but not project gun/ATM detections.
 4. Select **Stop**. Confirm camera access is released before starting another source. To check recovery, temporarily disconnect/re-enable the camera or use a camera that can be safely toggled; the app should show a recovery/error state and resume on new frames.
 
 ### Uploaded-video checklist
 
-1. In **Live detection**, choose **Upload Video**, select a readable MP4/AVI/MOV/MKV, and select **Start**.
+1. In **Video analysis**, choose **Upload Video**, select a readable MP4/AVI/MOV/MKV, and select **Start**.
 2. Confirm the annotated inference image advances, detection table and metrics update, and the UI reports decode/inference errors instead of presenting stale frames as current.
 3. Select **Stop** and confirm the temporary upload is removed. Repeat with a short clip before testing long videos.
 
@@ -162,13 +185,13 @@ smart-vision/
 
 ## Model files and supported classes
 
-The custom detector path is `models/yolo11s_fine_tune_v3.pt` (or `SMARTVISION_YOLO_MODEL_PATH`). The application reports the actual loaded class IDs and names, checks its six class names, matching weights hash, precision/recall/mAP metrics, and representative validation-image coverage. The training script saves predictions for one validation image per class to a unique run folder. The COCO fallback's generic `knife` prediction is shown as detector-only and is never promoted to the project's validated `knife` threat class. A generic fallback does not detect guns, pistols, or rifles.
+The custom detector path is `models/yolo11s_fine_tune_v3.pt` (or `SMARTVISION_YOLO_MODEL_PATH`). The application reports the actual loaded class IDs and names and verifies a fresh sidecar against the exact checkpoint path and SHA-256, current validation dataset, all required metrics and configured thresholds, and completed representative tests. The standalone validator saves predictions and per-class results under `runs\validation`; training by itself never creates a production-valid sidecar. The COCO fallback's generic `knife` prediction is shown as detector-only and is never promoted to the project's validated `knife` threat class. A generic fallback does not detect guns, pistols, or rifles.
 
 When the custom file is absent, the app explicitly falls back to the generic 80-class `yolo11s.pt` COCO model; that model has no `gun` or `atm` class. It can show its `person`, `backpack`, `handbag`, and generic `knife` predictions, but the generic knife is not treated as a project weapon.
 
 Threat incidents are sent to FastAPI on a bounded background queue and saved to the root-relative SQLite database independently of notification opt-in. The API validates threat levels against the project's rule outputs, persists detected class, confidence, track ID, event details, and notification status, and supports idempotent retries. The dashboard reads this same database through `GET /api/v1/incidents`; history survives restarts.
 
-Phone alerts use ntfy. Delivery requires all configured safeguards: approved/validated custom model weights, `SMARTVISION_ALERT_ENDPOINT_VERIFIED=true`, `SMARTVISION_ALERTS_ENABLED=true`, and a non-empty `SMARTVISION_NTFY_TOPIC`. The server stores the incident before attempting ntfy delivery. Notification results are recorded as `pending`, `sent`, `failed`, or `disabled`; only an HTTP 2xx response is treated as sent. Connection and HTTP errors do not remove the incident. The ntfy request has a bounded timeout and runs after API persistence, outside video-frame inference.
+Phone alerts use ntfy. Delivery requires all configured safeguards: a loaded and validated custom model, explicit sidecar production approval, `SMARTVISION_AUTO_ALERTS_APPROVED=true`, `SMARTVISION_ALERT_ENDPOINT_VERIFIED=true`, `SMARTVISION_ALERTS_ENABLED=true`, and a non-empty `SMARTVISION_NTFY_TOPIC`. `GET /api/v1/notifications/status` reports transport, configuration, runtime model, validation, approval, automatic-alert state, and a blocking reason separately. The server stores incidents whether delivery is allowed or blocked. Notification statuses distinguish `blocked_validation`, `blocked_operator_approval`, `blocked_configuration`, `pending`, `sent`, and `failed`; only an HTTP 2xx response is treated as sent. Connection and HTTP errors do not remove the incident. The ntfy request has a bounded timeout and runs after API persistence, outside video-frame inference.
 
 To configure it from PowerShell, set the environment before launching both services (replace the topic placeholder locally; do not commit it):
 
@@ -183,15 +206,43 @@ $env:SMARTVISION_ALERT_ENDPOINT_VERIFIED = "true"
 $env:SMARTVISION_NTFY_TOPIC = "<your-private-topic>"
 ```
 
-The **Send safe test notification** action on Model and system health sends a test message without creating a fake detection incident. Do not use a synthetic incident to verify production storage.
+The **Phone alerts** page provides a safe test request without creating a fake detection incident. A 2xx response means ntfy accepted the provider request; it does not confirm phone receipt. Do not use a synthetic incident to verify production storage.
 
 The inference client deduplicates a source/track/event/class during its cooldown and attaches a stable idempotency key to each event window. FastAPI returns the existing record for retries without creating another row or scheduling another notification. A generic model or unvalidated six-class checkpoint can still use the dashboard, but cannot authorize phone alerts.
 
-The six-class dataset configuration is `The_final-4/data.yaml` (14,018 train, 4,005 validation, and 2,002 test images). Training is CPU-only here and can take many hours. The training script creates a timestamped output directory and refuses to overwrite existing application weights or validation metadata:
+The six-class dataset configuration is `The_final-4/data.yaml` (14,018 train, 4,005 validation, and 2,002 test images). Audit all three splits before training; this is a read-only scan that writes a JSON report and annotated samples under `runs\dataset_audit`:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\train_weapon_cpu.py
+.\.venv\Scripts\python.exe scripts\audit_dataset.py --data The_final-4\data.yaml
 ```
+
+The audit checks configured class IDs, readable images, label correspondence, normalized box/polygon coordinates, duplicate image bytes, cross-split leakage, per-class image/instance counts, and annotation visualizations. Empty label files are reported as valid negative examples; missing labels, malformed annotations, class-map mismatches, corrupt images, and exact cross-split duplicates fail the audit. Review basename matches and class imbalance warnings manually.
+
+Training is CPU-only here and can take many hours. It creates a unique output directory, hard-links images when supported, converts valid polygon annotations into enclosing detection boxes in a separate staging copy, leaves original data untouched, and records the experiment configuration. It refuses to overwrite existing experiments and does not choose a production checkpoint:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\train_weapon_improved.py --data The_final-4\data.yaml --device cpu --epochs 100 --image-size 640 --batch 4 --workers 0 --patience 25 --seed 42
+```
+
+If interrupted, resume the exact run using its run directory and the same dataset configuration:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\train_weapon_improved.py --data The_final-4\data.yaml --resume-run "runs\detect\<exact-run-directory>"
+```
+
+After training, evaluate each candidate with the same settings and acceptance thresholds. Run validation first; only the `val` operation can create/update the checkpoint's matching validation sidecar:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\validate_detector.py --checkpoint "runs\detect\<run>\weights\best.pt" --data The_final-4\data.yaml --split val --device cpu
+```
+
+After model selection, run a one-time final evaluation on the held-out `test` split. It creates `final_test_report.json` and deliberately does not replace the validation sidecar:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\validate_detector.py --checkpoint "runs\detect\<selected-run>\weights\best.pt" --data The_final-4\data.yaml --split test --device cpu
+```
+
+The dashboard has Overview, Live detection, Video analysis, Incident history, Analytics, Model performance, Dataset and training, Phone alerts, System health, and Settings pages. Model/dataset pages display only saved reports; the dashboard never fabricates metrics or starts training.
 
 The optional action checkpoint path is `models/lstm_action_recognition_pro_v2.pth`. Action inference requires a compatible bidirectional LSTM checkpoint and consecutive sequences of 30 valid poses. Each pose frame is 132 `float32` values in MediaPipe landmark order, with `(x, y, z, visibility)` per landmark, estimated from the detected person crop. Missing/invalid poses break the sequence; no prediction is made before a complete sequence is collected. Checkpoints record the sequence length, feature layout, architecture, dropout, and class map, all of which the loader validates along with tensor shapes.
 
@@ -222,6 +273,15 @@ For a manual Windows launch from the project root, open two PowerShell terminals
 .\.venv\Scripts\python.exe -m uvicorn server.main:app --host 127.0.0.1 --port 8000
 .\.venv\Scripts\python.exe -m streamlit run pipeline\app.py --server.port 8501
 ```
+
+Verify backend notification gates without exposing the ntfy topic:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/notifications/status | ConvertTo-Json -Depth 5
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/v1/notifications/test | ConvertTo-Json -Depth 5
+```
+
+The test endpoint exercises transport only. Production approval requires a passing current validation record, configured notification transport, explicit verified endpoint setting, and a Windows account listed in `SMARTVISION_ALERT_APPROVERS`. After reviewing the report, run the approval command above from that account, then separately set `SMARTVISION_AUTO_ALERTS_APPROVED=true` and restart the backend and inference/dashboard processes. Never enable the setting to bypass a failed validation or missing approval record.
 
 ---
 

@@ -1,165 +1,267 @@
+"""Create a detection-format staging copy without changing source annotations."""
 
-from pathlib import Path
+import math
+import os
 import shutil
+from pathlib import Path
+
 import yaml
+
+from src.config import (
+    EXPECTED_DETECTOR_CLASSES,
+    YOLO_LABEL_BOUNDARY_TOLERANCE,
+)
+
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "The_final-4"
 DEST = ROOT / "The_final-4-detect"
-
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-
-
-def polygon_to_box(values):
-    """Convert normalized polygon x,y pairs into YOLO x_center,y_center,w,h."""
-    xs = values[0::2]
-    ys = values[1::2]
-
-    x1, x2 = min(xs), max(xs)
-    y1, y2 = min(ys), max(ys)
-
-    return [
-        (x1 + x2) / 2,
-        (y1 + y2) / 2,
-        x2 - x1,
-        y2 - y1,
-    ]
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+SPLITS = {"train": ("train",), "val": ("val", "valid", "validation"), "test": ("test",)}
 
 
-def format_number(value):
-    return f"{value:.8f}".rstrip("0").rstrip(".")
+def _class_names(configuration):
+    names = configuration.get("names")
+    if isinstance(names, dict):
+        try:
+            return [
+                str(names[index]).strip().lower()
+                for index in range(len(names))
+            ]
+        except KeyError:
+            return []
+    if isinstance(names, list):
+        return [str(name).strip().lower() for name in names]
+    return []
+
+
+def _format_number(value):
+    return f"{value:.8f}"
+
+
+def _convert_label_row(line, label_path, class_count):
+    fields = line.split()
+    if not fields:
+        raise ValueError(f"{label_path}: empty annotation row.")
+    try:
+        class_id = int(fields[0])
+    except ValueError as exc:
+        raise ValueError(f"{label_path}: invalid class id {fields[0]!r}.") from exc
+    if not 0 <= class_id < class_count:
+        raise ValueError(
+            f"{label_path}: Class id {class_id} is outside [0, {class_count - 1}]."
+        )
+    try:
+        coordinates = [float(value) for value in fields[1:]]
+    except ValueError as exc:
+        raise ValueError(f"{label_path}: non-numeric annotation coordinate.") from exc
+    if not all(math.isfinite(value) and 0 <= value <= 1 for value in coordinates):
+        raise ValueError(
+            f"{label_path}: coordinates must be finite normalized values in [0, 1]."
+        )
+
+    converted = False
+    if len(coordinates) == 4:
+        center_x, center_y, width, height = coordinates
+    elif len(coordinates) >= 6 and len(coordinates) % 2 == 0:
+        xs = coordinates[0::2]
+        ys = coordinates[1::2]
+        center_x = (min(xs) + max(xs)) / 2
+        center_y = (min(ys) + max(ys)) / 2
+        width = max(xs) - min(xs)
+        height = max(ys) - min(ys)
+        converted = True
+    else:
+        raise ValueError(
+            f"{label_path}: expected four box coordinates or at least six "
+            "even-count polygon coordinates."
+        )
+    if width <= 0 or height <= 0:
+        raise ValueError(f"{label_path}: box width and height must be positive.")
+    bounds = (
+        center_x - width / 2,
+        center_y - height / 2,
+        center_x + width / 2,
+        center_y + height / 2,
+    )
+    overshoot = max(
+        0.0,
+        -bounds[0],
+        -bounds[1],
+        bounds[2] - 1,
+        bounds[3] - 1,
+    )
+    if overshoot > YOLO_LABEL_BOUNDARY_TOLERANCE:
+        raise ValueError(
+            f"{label_path}: derived bounding box is outside the image."
+        )
+    clipped = overshoot > 0
+    if clipped:
+        x1, y1, x2, y2 = (
+            max(0.0, bounds[0]),
+            max(0.0, bounds[1]),
+            min(1.0, bounds[2]),
+            min(1.0, bounds[3]),
+        )
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        width = x2 - x1
+        height = y2 - y1
+
+    values = " ".join(_format_number(value) for value in (
+        center_x,
+        center_y,
+        width,
+        height,
+    ))
+    return f"{class_id} {values}", converted, clipped
+
+
+def _resolve(root, value):
+    path = Path(value).expanduser()
+    return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+
+def prepare_detection_dataset(source_yaml, staging_root):
+    source_yaml = Path(source_yaml).expanduser().resolve()
+    staging_root = Path(staging_root).expanduser().resolve()
+    if not source_yaml.is_file():
+        raise FileNotFoundError(f"Missing dataset config: {source_yaml}")
+    if not staging_root.is_dir():
+        raise FileNotFoundError(
+            f"Staging directory must exist and be empty: {staging_root}"
+        )
+    if any(staging_root.iterdir()):
+        raise FileExistsError(
+            f"Staging directory is not empty; refusing to overwrite: {staging_root}"
+        )
+
+    with source_yaml.open("r", encoding="utf-8-sig") as file:
+        config = yaml.safe_load(file)
+    if not isinstance(config, dict):
+        raise ValueError("Dataset configuration must be a YAML mapping.")
+    class_names = _class_names(config)
+    if (
+        class_names != list(EXPECTED_DETECTOR_CLASSES)
+        or config.get("nc") != len(EXPECTED_DETECTOR_CLASSES)
+    ):
+        raise ValueError("Dataset class mapping does not match the six-class contract.")
+
+    source_root = _resolve(source_yaml.parent, config.get("path", source_yaml.parent))
+    counts = {
+        "linked_images": 0,
+        "copied_images": 0,
+        "box_rows": 0,
+        "converted_polygon_rows": 0,
+        "rounding_boundary_rows": 0,
+        "empty_label_files": 0,
+    }
+    output_config = dict(config)
+    output_config["path"] = str(staging_root)
+    for canonical, aliases in SPLITS.items():
+        source_value = next(
+            (config[name] for name in aliases if name in config),
+            None,
+        )
+        if source_value is None:
+            raise ValueError(f"Dataset configuration has no {canonical} split.")
+        values = source_value if isinstance(source_value, list) else [source_value]
+        if len(values) != 1:
+            raise ValueError(
+                f"{canonical} split must contain exactly one image directory."
+            )
+        source_images = _resolve(source_root, values[0])
+        source_labels = source_images.parent / "labels"
+        if not source_images.is_dir() or not source_labels.is_dir():
+            raise FileNotFoundError(
+                f"Missing images or labels for {canonical}: {source_images}"
+            )
+        target_name = "valid" if canonical == "val" else canonical
+        target_images = staging_root / target_name / "images"
+        target_labels = staging_root / target_name / "labels"
+        target_images.mkdir(parents=True)
+        target_labels.mkdir(parents=True)
+
+        image_paths = sorted(
+            path for path in source_images.rglob("*")
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTS
+        )
+        if not image_paths:
+            raise ValueError(f"No images found in {canonical} split: {source_images}")
+        for image_path in image_paths:
+            relative_path = image_path.relative_to(source_images)
+            staged_image = target_images / relative_path
+            staged_image.parent.mkdir(parents=True, exist_ok=True)
+            label_path = source_labels / relative_path.with_suffix(".txt")
+            if not label_path.is_file():
+                raise FileNotFoundError(
+                    f"Missing label file for image {image_path}: {label_path}"
+                )
+            try:
+                os.link(image_path, staged_image)
+                counts["linked_images"] += 1
+            except OSError:
+                shutil.copy2(image_path, staged_image)
+                counts["copied_images"] += 1
+
+            staged_label = target_labels / relative_path.with_suffix(".txt")
+            staged_label.parent.mkdir(parents=True, exist_ok=True)
+            converted_rows = []
+            for line_number, line in enumerate(
+                label_path.read_text(encoding="utf-8-sig").splitlines(),
+                start=1,
+            ):
+                if not line.strip():
+                    continue
+                try:
+                    converted, was_polygon, clipped = _convert_label_row(
+                        line,
+                        label_path,
+                        len(class_names),
+                    )
+                except ValueError as exc:
+                    raise ValueError(f"{exc} Line {line_number}.") from exc
+                converted_rows.append(converted)
+                counts[
+                    "converted_polygon_rows" if was_polygon else "box_rows"
+                ] += 1
+                if clipped:
+                    counts["rounding_boundary_rows"] += 1
+            if not converted_rows:
+                counts["empty_label_files"] += 1
+            staged_label.write_text(
+                "\n".join(converted_rows)
+                + ("\n" if converted_rows else ""),
+                encoding="utf-8",
+            )
+
+    output_config["train"] = "train/images"
+    output_config["val"] = "valid/images"
+    output_config["test"] = "test/images"
+    staged_yaml = staging_root / "data.yaml"
+    staged_yaml.write_text(
+        yaml.safe_dump(output_config, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    return staged_yaml, counts
 
 
 def main():
     if not (SOURCE / "data.yaml").is_file():
         raise FileNotFoundError(f"Missing dataset config: {SOURCE / 'data.yaml'}")
-
     if DEST.exists():
         raise FileExistsError(
             f"{DEST} already exists. Nothing was overwritten. "
-            "Inspect it or choose a new destination before running again."
+            "Choose a new staging destination before running again."
         )
-
-    config = yaml.safe_load((SOURCE / "data.yaml").read_text(encoding="utf-8"))
-
-    # Keep the expected classes explicit and verify source config.
-    names = config.get("names")
-    print("Dataset classes:", names)
-
-    if not names or len(names) != 6:
-        raise ValueError("Expected exactly six classes in data.yaml.")
-
     DEST.mkdir(parents=True)
-
-    stats = {
-        "box_rows": 0,
-        "polygon_rows_converted": 0,
-        "empty_files": 0,
-        "bad_rows": 0,
-    }
-
-    for split in ("train", "valid", "test"):
-        source_images = SOURCE / split / "images"
-        source_labels = SOURCE / split / "labels"
-        dest_images = DEST / split / "images"
-        dest_labels = DEST / split / "labels"
-
-        if not source_images.is_dir() or not source_labels.is_dir():
-            raise FileNotFoundError(f"Missing images or labels for split: {split}")
-
-        dest_images.mkdir(parents=True)
-        dest_labels.mkdir(parents=True)
-
-        print(f"\nPreparing {split}...")
-
-        # Copy image files and preserve relative filenames.
-        for image_path in source_images.iterdir():
-            if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXTS:
-                shutil.copy2(image_path, dest_images / image_path.name)
-
-        # Copy and normalize annotations into detection-only YOLO labels.
-        for label_path in source_labels.glob("*.txt"):
-            output_rows = []
-
-            for line_number, line in enumerate(
-                label_path.read_text(encoding="utf-8").splitlines(), start=1
-            ):
-                line = line.strip()
-                if not line:
-                    continue
-
-                parts = line.split()
-
-                try:
-                    class_id = int(parts[0])
-                    values = [float(v) for v in parts[1:]]
-
-                    if class_id < 0 or class_id >= len(names):
-                        raise ValueError("class ID outside configured class range")
-
-                    if len(values) == 4:
-                        # Standard YOLO detection box.
-                        x, y, w, h = values
-                        stats["box_rows"] += 1
-
-                    elif len(values) >= 6 and len(values) % 2 == 0:
-                        # Polygon coordinates: x1,y1,x2,y2,...
-                        x, y, w, h = polygon_to_box(values)
-                        stats["polygon_rows_converted"] += 1
-
-                    else:
-                        raise ValueError(
-                            f"Unexpected number of coordinate values: {len(values)}"
-                        )
-
-                    # Ensure valid normalized coordinates.
-                    if not all(0.0 <= v <= 1.0 for v in (x, y, w, h)):
-                        raise ValueError("coordinates outside normalized range")
-                    if w <= 0 or h <= 0:
-                        raise ValueError("non-positive box width or height")
-
-                    output_rows.append(
-                        f"{class_id} " + " ".join(
-                            format_number(v) for v in (x, y, w, h)
-                        )
-                    )
-
-                except Exception as exc:
-                    stats["bad_rows"] += 1
-                    raise ValueError(
-                        f"{label_path}, line {line_number}: {exc}"
-                    ) from exc
-
-            if not output_rows:
-                stats["empty_files"] += 1
-
-            (dest_labels / label_path.name).write_text(
-                "\n".join(output_rows) + ("\n" if output_rows else ""),
-                encoding="utf-8",
-            )
-
-        print(f"Finished {split}")
-
-    # Build a dataset config pointing at the new copy.
-    config["path"] = str(DEST).replace("\\", "/")
-    config["train"] = "train/images"
-    config["val"] = "valid/images"
-    config["test"] = "test/images"
-
-    output_yaml = DEST / "data.yaml"
-    output_yaml.write_text(
-        yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
+    staged_yaml, counts = prepare_detection_dataset(
+        SOURCE / "data.yaml",
+        DEST,
     )
-
-    print("\nDataset preparation complete.")
-    print("New dataset:", DEST)
-    print("Config:", output_yaml)
+    print(f"Prepared detection dataset: {staged_yaml}")
+    print(f"Prepared annotation summary: {counts}")
     print("Original dataset was not modified.")
-    print("Standard box rows preserved:", stats["box_rows"])
-    print("Polygon rows converted:", stats["polygon_rows_converted"])
-    print("Empty label files preserved:", stats["empty_files"])
-    print("Invalid rows:", stats["bad_rows"])
 
 
 if __name__ == "__main__":

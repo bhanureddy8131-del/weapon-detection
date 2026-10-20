@@ -1,14 +1,18 @@
 
+import json
+import math
 import os
 import sys
 import time
 import tempfile
 import threading
-from datetime import date, datetime, time as datetime_time
+from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import requests
 import streamlit as st
+import torch
 
 # ============================================================
 # SMARTVISION PRO - PROJECT SETUP
@@ -37,7 +41,12 @@ from pipeline.latest_frame_capture import LatestFrameCapture
 
 API_URL = f"{API_BASE_URL}/incidents"
 HEALTH_URL = f"{API_BASE_URL}/health"
+NOTIFICATION_STATUS_URL = f"{API_BASE_URL}/notifications/status"
 TEST_NOTIFICATION_URL = f"{API_BASE_URL}/notifications/test"
+VALIDATION_REPORT_PATH = (
+    Path(ROOT_DIR) / "runs" / "validation" / "latest" / "validation_report.json"
+)
+DATASET_AUDIT_ROOT = Path(ROOT_DIR) / "runs" / "dataset_audit"
 
 IMAGE_SIZE_OPTIONS = [320, 416, 512, 640, 768, 960, 1280]
 
@@ -66,6 +75,7 @@ class APIHealthMonitor:
             "database_error": None,
             "notification_status": "unknown",
             "notification_error": None,
+            "notification_details": None,
             "latency_ms": None,
             "error": None,
             "checked_at": None,
@@ -111,6 +121,30 @@ class APIHealthMonitor:
                 notification_error = None
                 error = str(exc)
 
+            notification_details = None
+            if status:
+                try:
+                    notification_response = requests.get(
+                        NOTIFICATION_STATUS_URL,
+                        timeout=(0.5, 2.0),
+                    )
+                    notification_response.raise_for_status()
+                    notification_details = notification_response.json()
+                    if not isinstance(notification_details, dict):
+                        raise ValueError(
+                            "Invalid notification status response."
+                        )
+                    notification_status = notification_details.get(
+                        "transport_status",
+                        notification_status,
+                    )
+                    notification_error = notification_details.get(
+                        "transport_error",
+                    )
+                except (requests.RequestException, ValueError) as exc:
+                    notification_status = "unknown"
+                    notification_error = str(exc)
+
             with self._lock:
                 self._status = {
                     "healthy": status,
@@ -118,6 +152,7 @@ class APIHealthMonitor:
                     "database_error": database_error,
                     "notification_status": notification_status,
                     "notification_error": notification_error,
+                    "notification_details": notification_details,
                     "latency_ms": (
                         time.perf_counter() - started
                     ) * 1000,
@@ -264,6 +299,54 @@ def build_recent_detection_table(recent_detections):
     return pd.DataFrame(rows, columns=columns).tail(20)
 
 
+def _format_validation_cell(value):
+    if value is None:
+        return "Unavailable"
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(_format_validation_cell(item) for item in value)
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True, ensure_ascii=False)
+    if pd.isna(value):
+        return "Unavailable"
+    return str(value)
+
+
+def build_validation_acceptance_table(checks):
+    columns = ["Check", "Passed", "Actual", "Required"]
+    if not isinstance(checks, dict):
+        checks = {}
+
+    rows = []
+    for name, value in checks.items():
+        if not isinstance(value, dict):
+            continue
+        required = value.get(
+            "minimum",
+            value.get("maximum", value.get("expected")),
+        )
+        rows.append({
+            "Check": str(name),
+            "Passed": value.get("passed") is True,
+            "Actual": _format_validation_cell(value.get("actual")),
+            "Required": _format_validation_cell(required),
+        })
+
+    if not rows:
+        return pd.DataFrame({
+            "Check": pd.Series(dtype="string"),
+            "Passed": pd.Series(dtype="bool"),
+            "Actual": pd.Series(dtype="string"),
+            "Required": pd.Series(dtype="string"),
+        }, columns=columns)
+
+    frame = pd.DataFrame(rows, columns=columns)
+    frame["Check"] = frame["Check"].astype("string")
+    frame["Passed"] = frame["Passed"].astype(bool)
+    frame["Actual"] = frame["Actual"].astype("string")
+    frame["Required"] = frame["Required"].astype("string")
+    return frame
+
+
 # ============================================================
 # COMMON DASHBOARD HEADER
 # ============================================================
@@ -296,12 +379,16 @@ def render_status_header(runtime):
     if detector is None:
         detector_text = "Detector unavailable"
         detector_color = "red"
-    elif getattr(detector, "alerts_enabled", False):
-        detector_text = "Threat model approved"
-        detector_color = "green"
     elif getattr(detector, "is_custom_model", False):
-        detector_text = "Custom model unvalidated"
-        detector_color = "orange"
+        if not getattr(detector, "is_validated", False):
+            detector_text = "Model validation failed"
+            detector_color = "red"
+        elif not getattr(detector, "production_alerts_approved", False):
+            detector_text = "Model validated · approval missing"
+            detector_color = "orange"
+        else:
+            detector_text = "Model approved"
+            detector_color = "green"
     else:
         detector_text = "Generic model"
         detector_color = "orange"
@@ -333,13 +420,23 @@ def render_status_header(runtime):
     notification_status = health.get(
         "notification_status", "unknown"
     )
-    header[5].badge(
-        "Phone alerts ready" if notification_status == "ready"
-        else "Phone alerts off" if notification_status == "disabled"
-        else "Phone alerts unknown",
-        color="green" if notification_status == "ready"
-        else "gray",
-    )
+    notification_details = health.get("notification_details")
+    if (
+        isinstance(notification_details, dict)
+        and notification_details.get("automatic_alerts_enabled") is True
+    ):
+        header[5].badge("Automatic alerts enabled", color="green")
+    elif notification_status == "ready":
+        header[5].badge(
+            "ntfy transport ready · auto alerts blocked",
+            color="orange",
+        )
+    else:
+        header[5].badge(
+            "ntfy transport off" if notification_status == "disabled"
+            else "ntfy transport unknown",
+            color="gray",
+        )
 
 
 # ============================================================
@@ -417,15 +514,36 @@ def render_live_inference():
         ),
     )
 
+    notification_details = health.get("notification_details")
+    automatic_alerts_enabled = (
+        notification_details.get("automatic_alerts_enabled")
+        if isinstance(notification_details, dict)
+        else None
+    )
     status_cols[5].badge(
-        "Alerts: enabled" if delivery["enabled"]
-        else "Alerts: disabled",
-        color="green" if delivery["enabled"] else "orange",
+        "Automatic alerts: enabled"
+        if automatic_alerts_enabled is True
+        else "Automatic alerts: blocked"
+        if automatic_alerts_enabled is False
+        else "Automatic alerts: unknown",
+        color="green" if automatic_alerts_enabled is True else "orange",
     )
 
-    if not delivery["enabled"]:
+    if (
+        automatic_alerts_enabled is False
+        and isinstance(notification_details, dict)
+    ):
         st.warning(
-            "Threat notifications are disabled. "
+            "Automatic notifications are blocked. "
+            + str(
+                notification_details.get("blocked_reason")
+                or "Review the Phone alerts status page."
+            )
+        )
+    elif automatic_alerts_enabled is None and not delivery["enabled"]:
+        st.warning(
+            "The automatic-alert status endpoint is unavailable and local "
+            "notification delivery is disabled. "
             + str(delivery.get("disabled_reason"))
         )
 
@@ -704,16 +822,51 @@ def render_inference_snapshot():
     )
 
 
+@st.fragment(run_every="1s")
+def render_video_progress():
+    capture = st.session_state.get("smartvision_capture")
+    worker = st.session_state.get("smartvision_worker")
+    if capture is None or worker is None:
+        return
+    frame_count = getattr(capture, "frame_count", 0)
+    if frame_count > 0:
+        processed_frames = worker.snapshot().get("processed_frames", 0)
+        progress = min(1.0, processed_frames / frame_count)
+        st.progress(
+            progress,
+            text=(
+                f"Processed {min(processed_frames, frame_count):,} "
+                f"of {frame_count:,} video frames"
+            ),
+        )
+    else:
+        st.caption(
+            "Video frame count is unavailable; processing continues "
+            "through the bounded inference worker."
+        )
+
+
 # ============================================================
 # LIVE DETECTION CONTROLS
 # ============================================================
 
-def run_streamlit_inference_page():
-    st.title("Live detection")
-    st.caption(
-        "YOLO object detection · ByteTrack tracking · "
-        "LSTM action recognition · MediaPipe pose estimation"
-    )
+def run_streamlit_inference_page(video_analysis=False):
+    if video_analysis:
+        st.title("Video analysis")
+        st.caption(
+            "Analyze an uploaded or configured video using the same "
+            "inference worker as live detection."
+        )
+        source_key = "smartvision_video_source_choice"
+        default_source = "Upload Video"
+    else:
+        st.title("Live detection")
+        st.caption(
+            "YOLO object detection · ByteTrack tracking · "
+            "LSTM action recognition · MediaPipe pose estimation"
+        )
+        source_key = "smartvision_live_source_choice"
+        default_source = "Live Webcam"
 
     runtime = init_models_and_helpers()
 
@@ -765,13 +918,17 @@ def run_streamlit_inference_page():
         init_models_and_helpers.clear()
         st.rerun()
 
+    source_options = [
+        "Live Webcam",
+        "Select from Input Folder",
+        "Upload Video",
+    ]
+    if source_key not in st.session_state:
+        st.session_state[source_key] = default_source
     input_option = st.sidebar.selectbox(
         "Input source",
-        [
-            "Live Webcam",
-            "Select from Input Folder",
-            "Upload Video",
-        ],
+        source_options,
+        key=source_key,
     )
 
     source_path = None
@@ -1004,6 +1161,8 @@ def run_streamlit_inference_page():
     capture = st.session_state.get("smartvision_capture")
 
     if capture is not None:
+        if video_analysis and not capture.is_webcam:
+            render_video_progress()
         render_live_inference()
         render_inference_snapshot()
     else:
@@ -1063,7 +1222,7 @@ def fetch_incident_summary():
             or type(summary.get("today")) is not int
             or not isinstance(summary.get("by_class"), dict)
         ):
-            raise ValueError("Summary response has an invalid structure.")
+            raise ValueError("Summary response has a malformed structure.")
 
         return summary, None
 
@@ -1091,10 +1250,11 @@ def normalize_incidents(alerts):
         except (TypeError, ValueError):
             row["confidence"] = None
 
-        row["created_at"] = pd.to_datetime(
-            row.get("created_at"),
-            errors="coerce",
-            utc=True,
+        created_at = row.get("created_at")
+        row["created_at"] = (
+            pd.to_datetime(str(created_at), errors="coerce", utc=True)
+            if created_at is not None
+            else pd.NaT
         )
 
         row["threat_level"] = str(
@@ -1152,6 +1312,437 @@ def send_test_notification():
         return False, f"Notification test failed: {exc}"
 
 
+def read_json_report(path):
+    try:
+        with Path(path).open("r", encoding="utf-8") as report_file:
+            report = json.load(report_file)
+    except FileNotFoundError:
+        return None, f"Report is unavailable: {Path(path)}"
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"Could not read report: {exc}"
+    if not isinstance(report, dict):
+        return None, f"Report has an invalid structure: {Path(path)}"
+    return report, None
+
+
+def latest_dataset_audit():
+    if not DATASET_AUDIT_ROOT.is_dir():
+        return None
+    reports = sorted(
+        DATASET_AUDIT_ROOT.rglob("dataset_audit.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return reports[0] if reports else None
+
+
+def render_model_performance():
+    st.title("Model performance")
+    report, error = read_json_report(VALIDATION_REPORT_PATH)
+    if error:
+        st.info(
+            "No completed validation report is available yet. Run the "
+            "separate detector evaluator; the dashboard does not infer "
+            "validation results from checkpoint presence."
+        )
+        st.caption(error)
+        return
+    if report is None:
+        st.error("The validation report could not be loaded.")
+        return
+
+    summary = report.get("validation_summary", {})
+    required_metrics = ("precision", "recall", "map50", "map50_95")
+    metrics_present = (
+        isinstance(summary, dict)
+        and all(
+            isinstance(summary.get(metric), (int, float))
+            and not isinstance(summary.get(metric), bool)
+            and math.isfinite(float(summary[metric]))
+            for metric in required_metrics
+        )
+    )
+    acceptance_checks = report.get("acceptance_checks")
+    required_checks = (
+        "precision",
+        "recall",
+        "map50",
+        "map50_95",
+        "gun_recall",
+        "knife_recall",
+        "person_recall",
+        "representative_tests_complete",
+        "no_missed_weapon_detections",
+        "weapon_false_positive_limit",
+    )
+    checks_passed = (
+        isinstance(acceptance_checks, dict)
+        and all(
+            isinstance(acceptance_checks.get(name), dict)
+            and acceptance_checks[name].get("passed") is True
+            for name in required_checks
+        )
+    )
+    representative_record = report.get("representative_tests")
+    passed = (
+        report.get("validation_completed") is True
+        and report.get("validation_passed") is True
+        and report.get("evaluation_split") == "val"
+        and metrics_present
+        and checks_passed
+        and isinstance(representative_record, dict)
+        and representative_record.get("completed") is True
+    )
+    if passed:
+        st.success("The recorded validation passed its acceptance checks.")
+    else:
+        st.error(
+            "Validation did not pass. Production approval and automatic "
+            "alerts must remain disabled."
+        )
+
+    st.caption(
+        f"Checkpoint: {report.get('checkpoint_path', 'Unavailable')} · "
+        f"SHA-256: {report.get('checkpoint_sha256', 'Unavailable')}"
+    )
+    st.caption(
+        f"Completed: {report.get('validation_completed_at', 'Unavailable')} · "
+        f"Split: {report.get('evaluation_split', 'Unavailable')}"
+    )
+    metric_columns = st.columns(4)
+    for column, name, label in zip(
+        metric_columns,
+        ("precision", "recall", "map50", "map50_95"),
+        ("Precision", "Recall", "mAP50", "mAP50-95"),
+    ):
+        value = summary.get(name)
+        column.metric(
+            label,
+            f"{value:.3f}" if isinstance(value, (int, float)) else "Unavailable",
+        )
+
+    class_metrics = report.get("per_class_metrics")
+    if isinstance(class_metrics, dict) and class_metrics:
+        st.subheader("Per-class metrics")
+        rows = [
+            {"Class": name, **values}
+            for name, values in class_metrics.items()
+            if isinstance(values, dict)
+        ]
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    checks = acceptance_checks
+    if isinstance(checks, dict) and checks:
+        st.subheader("Acceptance checks")
+        st.dataframe(
+            build_validation_acceptance_table(checks),
+            hide_index=True,
+            width="stretch",
+        )
+
+    representative = report.get("representative_tests", {})
+    if isinstance(representative, dict):
+        st.subheader("Representative labeled-image tests")
+        st.write(
+            "Completed:",
+            representative.get("completed") is True,
+            "· Classes tested:",
+            ", ".join(representative.get("tested_classes", []))
+            or "Unavailable",
+        )
+        st.write(
+            "Missed weapon detections:",
+            representative.get("missed_weapon_detections", "Unavailable"),
+            "· Weapon false positives:",
+            representative.get("weapon_false_positives", "Unavailable"),
+        )
+
+    confusion_path = report.get("confusion_matrix_image")
+    if confusion_path and Path(confusion_path).is_file():
+        st.image(
+            str(confusion_path),
+            caption="Confusion matrix from this validation run",
+            width="stretch",
+        )
+    else:
+        st.caption("Confusion-matrix visualization is unavailable.")
+    for name, check in (checks or {}).items():
+        if isinstance(check, dict) and check.get("passed") is not True:
+            st.warning(f"Failed check: {name}")
+
+
+def render_dataset_training():
+    st.title("Dataset and training")
+    audit_path = latest_dataset_audit()
+    if audit_path is None:
+        st.info(
+            "No dataset audit report is available. Run the read-only audit "
+            "before starting a training experiment."
+        )
+    else:
+        audit, error = read_json_report(audit_path)
+        if error:
+            st.warning(error)
+        elif audit is not None:
+            if audit.get("audit_passed") is True:
+                st.success("Latest recorded dataset audit passed.")
+            else:
+                st.error("Latest recorded dataset audit did not pass.")
+            st.caption(f"Report: {audit_path}")
+            st.caption(
+                f"Dataset YAML: {audit.get('dataset_yaml', 'Unavailable')} · "
+                f"Completed: {audit.get('audit_completed_at', 'Unavailable')}"
+            )
+            split_summary = []
+            for split_name, values in audit.get("splits", {}).items():
+                class_rows = values.get("classes", {})
+                valid_annotations = values.get(
+                    "valid_annotation_rows",
+                    sum(
+                        counts.get("instances", 0)
+                        for counts in class_rows.values()
+                        if isinstance(counts, dict)
+                    ),
+                )
+                valid_labels = values.get(
+                    "valid_label_files",
+                    values.get("label_files_found", 0)
+                    - len(values.get("invalid_annotation_files", [])),
+                )
+                split_summary.append({
+                    "Split": split_name,
+                    "Images": values.get("image_count", "Unavailable"),
+                    "Readable": values.get("readable_images", "Unavailable"),
+                    "Labels": values.get("label_files_found", "Unavailable"),
+                    "Valid labels": valid_labels,
+                    "Valid annotations": valid_annotations,
+                    "Invalid rows": values.get(
+                        "invalid_annotation_rows",
+                        "Unavailable",
+                    ),
+                })
+            if split_summary:
+                st.dataframe(
+                    pd.DataFrame(split_summary),
+                    hide_index=True,
+                    width="stretch",
+                )
+            class_balance = audit.get("class_balance")
+            if isinstance(class_balance, dict):
+                st.subheader("Class distribution")
+                st.dataframe(
+                    pd.DataFrame([
+                        {"Class": name, **values}
+                        for name, values in class_balance.items()
+                    ]),
+                    hide_index=True,
+                    width="stretch",
+                )
+            duplicates = audit.get("duplicates", {})
+            if isinstance(duplicates, dict):
+                st.write(
+                    "Exact cross-split image leakage groups:",
+                    len(duplicates.get("exact_cross_split_leakage", [])),
+                )
+                st.write(
+                    "Same-name cross-split review candidates:",
+                    len(duplicates.get("same_basename_cross_split_suspicions", [])),
+                )
+            warnings = audit.get("warnings", [])
+            for warning in warnings:
+                st.warning(warning)
+            visualizations = audit.get("visualizations", [])
+            if visualizations:
+                st.subheader("Parsed annotation samples")
+                for item in visualizations[:6]:
+                    image_path = item.get("visualization")
+                    if image_path and Path(image_path).is_file():
+                        st.image(
+                            str(image_path),
+                            caption=f"{item.get('split')} · {item.get('class')}",
+                            width=260,
+                        )
+
+    st.subheader("Training experiments")
+    runs_root = Path(ROOT_DIR) / "runs" / "detect"
+    run_directories = sorted(
+        (
+            path for path in runs_root.glob("smartvision_weapon_*")
+            if path.is_dir()
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    ) if runs_root.is_dir() else []
+    if not run_directories:
+        st.info("No SmartVision training experiments are recorded.")
+    else:
+        run_rows = []
+        for run_directory in run_directories:
+            completion_path = (
+                run_directory / "smartvision_training_completion.json"
+            )
+            run_rows.append({
+                "Run": run_directory.name,
+                "Completed": completion_path.is_file(),
+                "Best checkpoint": (
+                    str(run_directory / "weights" / "best.pt")
+                    if (run_directory / "weights" / "best.pt").is_file()
+                    else "Unavailable"
+                ),
+            })
+        st.dataframe(pd.DataFrame(run_rows), hide_index=True, width="stretch")
+
+    st.code(
+        r".\.venv\Scripts\python.exe scripts\train_weapon_improved.py "
+        r"--data The_final-4\data.yaml",
+        language="powershell",
+    )
+    st.caption(
+        "Training is a separate, resource-intensive operation. This page "
+        "does not start or resume a training job."
+    )
+
+
+def render_analytics():
+    st.title("Analytics")
+    st.caption(
+        "Charts below use actual stored incident records returned by the "
+        "backend; the incident API query is capped at 200 records."
+    )
+    summary, summary_error = fetch_incident_summary()
+    incidents, incident_error = fetch_incidents(limit=200)
+    if summary_error:
+        st.warning(summary_error)
+    if incident_error:
+        st.error(incident_error)
+        return
+    if summary is not None:
+        columns = st.columns(3)
+        columns[0].metric("All-time incidents", summary["total"])
+        columns[1].metric("Incidents today", summary["today"])
+        columns[2].metric("Recorded classes", len(summary["by_class"]))
+    frame, invalid = normalize_incidents(incidents)
+    if invalid:
+        st.warning(f"Ignored {invalid} invalid API records.")
+    if frame.empty:
+        st.info("No stored incident data is available for analytics.")
+        return
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Incidents by class")
+        st.bar_chart(frame["label"].value_counts(), horizontal=True)
+    with right:
+        st.subheader("Notification delivery outcomes")
+        st.bar_chart(
+            frame["notification_status"].value_counts(),
+            horizontal=True,
+        )
+
+    timed = frame.dropna(subset=["created_at"])
+    if not timed.empty:
+        st.subheader("Incident activity over time")
+        st.line_chart(
+            timed.groupby(pd.Grouper(key="created_at", freq="h")).size()
+        )
+
+
+def render_phone_alerts():
+    st.title("Phone alerts")
+    health = get_api_health_monitor().snapshot()
+    details = health.get("notification_details")
+    if not isinstance(details, dict):
+        st.warning(
+            "Notification status is unavailable until the FastAPI status "
+            "endpoint responds."
+        )
+        if health.get("notification_error"):
+            st.caption(health["notification_error"])
+        return
+
+    values = (
+        ("Transport", details.get("transport_status", "unknown")),
+        (
+            "Notification configuration",
+            "Enabled" if details.get("notification_configuration_enabled")
+            else "Disabled",
+        ),
+        (
+            "Custom model loaded",
+            "Yes" if details.get("custom_model_loaded") else "No",
+        ),
+        (
+            "Model validation",
+            "Passed" if details.get("model_validation_passed") else "Failed",
+        ),
+        (
+            "Production alert approval",
+            "Granted" if details.get("production_alerts_approved") else "Missing",
+        ),
+        (
+            "Automatic alerts",
+            "Enabled" if details.get("automatic_alerts_enabled") else "Blocked",
+        ),
+    )
+    st.dataframe(
+        pd.DataFrame([{"Gate": label, "Status": value} for label, value in values]),
+        hide_index=True,
+        width="stretch",
+    )
+    blocked_reason = details.get("blocked_reason")
+    if blocked_reason:
+        st.error(f"Automatic alerts are blocked: {blocked_reason}")
+
+    failures = details.get("validation_failures", [])
+    if failures:
+        st.subheader("Validation blockers")
+        for failure in failures:
+            st.warning(str(failure))
+
+    if details.get("transport_status") == "ready":
+        st.subheader("Manual transport test")
+        st.caption(
+            "This sends a test request only. Provider acceptance does not "
+            "confirm delivery to the phone."
+        )
+        if st.button("Send test request to ntfy", type="primary"):
+            sent, message = send_test_notification()
+            if sent:
+                st.success(
+                    "ntfy accepted the test request. Phone receipt is not "
+                    f"confirmed. {message}"
+                )
+            else:
+                st.error(message)
+
+    st.subheader("Recent incident delivery attempts")
+    incidents, error = fetch_incidents(limit=20)
+    if error:
+        st.warning(error)
+    elif incidents:
+        rows = [
+            {
+                "Created": item.get("created_at"),
+                "Class": item.get("detected_class") or item.get("label"),
+                "Status": item.get("notification_status", "unknown"),
+                "Error": item.get("notification_error"),
+            }
+            for item in incidents
+            if isinstance(item, dict)
+        ]
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    else:
+        st.info("No incident delivery attempts are recorded.")
+
+    st.info(
+        "Operator approval is a separate, explicit step. Review the matching "
+        "validation report, configure the authorized Windows account, and "
+        "run scripts\\approve_detector_alerts.py only after all checks pass."
+    )
+
+
 # ============================================================
 # OVERVIEW PAGE
 # ============================================================
@@ -1170,7 +1761,7 @@ def render_overview():
 
     weapon_items = state.get("weapon_detections", [])
 
-    cols = st.columns(6)
+    cols = st.columns(7)
 
     cols[0].metric(
         "Active cameras",
@@ -1183,12 +1774,12 @@ def render_overview():
     )
     cols[1].metric(
         "People detected",
-        state.get("people_detected", 0),
+        state.get("people_detected", 0) if worker is not None else "Unavailable",
         border=True,
     )
     cols[2].metric(
         "Weapon detections",
-        len(weapon_items),
+        len(weapon_items) if worker is not None else "Unavailable",
         border=True,
     )
     cols[3].metric(
@@ -1203,12 +1794,32 @@ def render_overview():
     )
     cols[5].metric(
         "Inference FPS",
-        f"{result.get('inference_fps', 0.0):.1f}",
+        f"{result['inference_fps']:.1f}" if worker is not None else "Unavailable",
+        border=True,
+    )
+    yolo_timing = result.get("timing_summary_ms", {}).get("yolo", {})
+    yolo_latency = yolo_timing.get("mean") if isinstance(yolo_timing, dict) else None
+    cols[6].metric(
+        "YOLO latency",
+        f"{yolo_latency:.1f} ms"
+        if isinstance(yolo_latency, (int, float))
+        else "Unavailable",
         border=True,
     )
 
     if summary_error:
         st.warning(summary_error)
+
+    notification_details = get_api_health_monitor().snapshot().get(
+        "notification_details"
+    )
+    if isinstance(notification_details, dict) and notification_details.get(
+        "blocked_reason"
+    ):
+        st.warning(
+            "Automatic notifications are blocked: "
+            + str(notification_details["blocked_reason"])
+        )
 
     alerts, error = fetch_incidents(limit=200)
 
@@ -1509,22 +2120,16 @@ def render_detection_settings(runtime):
     detector = runtime["detector"]
     class_ids = available_class_ids(detector)
 
-    # Use a persistent state key so Streamlit preserves the selection.
-    if "smartvision_yolo_input_size" not in st.session_state:
-        initial_size = current_image_size()
-        st.session_state["smartvision_yolo_input_size"] = initial_size
-
-    current_size = st.session_state["smartvision_yolo_input_size"]
-
-    if current_size not in IMAGE_SIZE_OPTIONS:
-        current_size = 320
-        st.session_state["smartvision_yolo_input_size"] = 320
+    widget_key = "smartvision_yolo_input_size"
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = current_image_size()
+    elif st.session_state[widget_key] not in IMAGE_SIZE_OPTIONS:
+        st.session_state[widget_key] = 320
 
     st.select_slider(
         "YOLO input size",
         options=IMAGE_SIZE_OPTIONS,
-        value=current_size,
-        key="smartvision_yolo_input_size",
+        key=widget_key,
         help=(
             "320 is the recommended starting point for CPU webcam "
             "inference. Larger sizes may improve small-object detail "
@@ -1533,7 +2138,7 @@ def render_detection_settings(runtime):
     )
 
     st.session_state["smartvision_image_size"] = int(
-        st.session_state["smartvision_yolo_input_size"]
+        st.session_state[widget_key]
     )
 
     st.caption(
@@ -1643,6 +2248,14 @@ def render_detection_settings(runtime):
 def render_system_health(runtime):
     st.title("Model and system health")
 
+    st.caption(f"Python {sys.version.split()[0]} · PyTorch {torch.__version__}")
+    if torch.cuda.is_available():
+        st.info(
+            f"CUDA is available with {torch.cuda.device_count()} device(s)."
+        )
+    else:
+        st.info("CUDA is unavailable; PyTorch inference uses CPU.")
+
     if runtime is None or runtime.get("detector") is None:
         st.error("Detector is unavailable.")
         return
@@ -1748,6 +2361,32 @@ def render_system_health(runtime):
         health.get("notification_status", "unknown"),
     )
 
+    notification_details = health.get("notification_details")
+    if isinstance(notification_details, dict):
+        st.subheader("Production notification gates")
+        st.write(
+            "Notification configuration enabled:",
+            bool(notification_details.get("notification_configuration_enabled")),
+        )
+        st.write(
+            "Backend custom detector loaded:",
+            bool(notification_details.get("custom_model_loaded")),
+        )
+        st.write(
+            "Detector validation passed:",
+            bool(notification_details.get("model_validation_passed")),
+        )
+        st.write(
+            "Production alert approval granted:",
+            bool(notification_details.get("production_alerts_approved")),
+        )
+        st.write(
+            "Automatic alerts enabled:",
+            bool(notification_details.get("automatic_alerts_enabled")),
+        )
+        if notification_details.get("blocked_reason"):
+            st.warning(notification_details["blocked_reason"])
+
     if health.get("error"):
         st.warning(health["error"])
 
@@ -1790,11 +2429,16 @@ def main():
         [
             "Overview",
             "Live detection",
-            "Alert history",
-            "Camera management",
-            "Detection settings",
-            "Model and system health",
+            "Video analysis",
+            "Incident history",
+            "Analytics",
+            "Model performance",
+            "Dataset and training",
+            "Phone alerts",
+            "System health",
+            "Settings",
         ],
+        key="smartvision_navigation",
     )
 
     if page == "Overview":
@@ -1803,20 +2447,33 @@ def main():
     elif page == "Live detection":
         run_streamlit_inference_page()
 
-    elif page == "Alert history":
+    elif page == "Video analysis":
+        run_streamlit_inference_page(video_analysis=True)
+
+    elif page == "Incident history":
         render_alert_history()
 
-    elif page == "Camera management":
-        render_camera_management()
+    elif page == "Analytics":
+        render_analytics()
 
-    elif page == "Detection settings":
+    elif page == "Model performance":
+        render_model_performance()
+
+    elif page == "Dataset and training":
+        render_dataset_training()
+
+    elif page == "Phone alerts":
+        render_phone_alerts()
+
+    elif page == "System health":
+        render_system_health(runtime)
+
+    elif page == "Settings":
+        render_camera_management()
         if runtime is None:
             st.error("The detector could not be loaded.")
         else:
             render_detection_settings(runtime)
-
-    elif page == "Model and system health":
-        render_system_health(runtime)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,7 @@ class LatestFrameCapture:
         self.dropped_frames = 0
         self.buffer_setting_supported = None
         self.source_fps = 0.0
+        self.frame_count = 0
         self.error = None
         self.opened = False
         self._thread.start()
@@ -77,6 +78,13 @@ class LatestFrameCapture:
             self.source_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
             if self.source_fps <= 0:
                 self.source_fps = 20.0
+            try:
+                self.frame_count = max(
+                    0,
+                    int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0),
+                )
+            except (TypeError, ValueError, OverflowError):
+                self.frame_count = 0
 
         self.opened = True
         self.error = None
