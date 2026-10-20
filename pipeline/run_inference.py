@@ -1,5 +1,4 @@
-﻿
-# pipeline/run_inference.py
+﻿# pipeline/run_inference.py
 
 import os
 import sys
@@ -87,6 +86,28 @@ FRAME_HEIGHT = max(240, min(FRAME_HEIGHT, 1080))
 DISPLAY_SCALE = max(0.25, min(DISPLAY_SCALE, 1.0))
 
 # ---------------------------------------------------------------------
+# DEMO MODE
+# ---------------------------------------------------------------------
+
+# DEMO ONLY: must match SMARTVISION_DEMO_MODE on the server.
+# When ON, incidents are posted to the server without requiring a
+# validated detector. The server labels every alert as unvalidated.
+# Leave OFF (default) for any real use.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(ROOT_DIR) / ".env")
+except ImportError:
+    pass
+
+DEMO_MODE = (
+    os.getenv("SMARTVISION_DEMO_MODE", "false")
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+
+# ---------------------------------------------------------------------
 # MODEL LOADING
 # ---------------------------------------------------------------------
 
@@ -153,18 +174,27 @@ def load_models():
             lstm_path,
         )
 
-    production_alerts_enabled = (
-        detector.alerts_enabled
-        and ALERTS_ENABLED
-        and ALERT_ENDPOINT_VERIFIED
-    )
+    if DEMO_MODE:
+        # Demo only: skip the detector-validation requirement.
+        production_alerts_enabled = True
 
-    if not production_alerts_enabled:
         logger.warning(
-            "Production alert delivery is disabled until the detector "
-            "and alert endpoint are validated and the required settings "
-            "are enabled."
+            "DEMO MODE is ON: alerts are sent without detector "
+            "validation. Do not use in production."
         )
+    else:
+        production_alerts_enabled = (
+            detector.alerts_enabled
+            and ALERTS_ENABLED
+            and ALERT_ENDPOINT_VERIFIED
+        )
+
+        if not production_alerts_enabled:
+            logger.warning(
+                "Production alert delivery is disabled until the detector "
+                "and alert endpoint are validated and the required settings "
+                "are enabled."
+            )
 
     threat_manager = ThreatManager(
         alerts_enabled=production_alerts_enabled
@@ -1055,7 +1085,11 @@ class LatestFrameCapture:
     """
 
     def __init__(self, source):
-        self.capture = cv2.VideoCapture(source, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(source)
+        self.capture = (
+            cv2.VideoCapture(source, cv2.CAP_DSHOW)
+            if os.name == "nt"
+            else cv2.VideoCapture(source)
+        )
 
         self.lock = threading.Lock()
         self.frame = None
@@ -1239,8 +1273,16 @@ def _run_single_source_offline(
             if not np.isfinite(fps) or fps <= 0:
                 fps = 20.0
 
-        width = int(capture.capture.get(cv2.CAP_PROP_FRAME_WIDTH)) if is_webcam else int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(capture.capture.get(cv2.CAP_PROP_FRAME_HEIGHT)) if is_webcam else int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        width = (
+            int(capture.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            if is_webcam
+            else int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        )
+        height = (
+            int(capture.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if is_webcam
+            else int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        )
 
         if width <= 0:
             width = FRAME_WIDTH
@@ -1358,6 +1400,17 @@ def _run_single_source_offline(
                 (255, 255, 0),
                 2,
             )
+
+            if DEMO_MODE:
+                cv2.putText(
+                    processed,
+                    "DEMO MODE - UNVALIDATED MODEL",
+                    (15, 109),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 165, 255),
+                    2,
+                )
 
             if DISPLAY_SCALE < 1.0:
                 display_frame = cv2.resize(

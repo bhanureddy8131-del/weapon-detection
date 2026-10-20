@@ -50,13 +50,30 @@ ALERT_STORAGE_DIR = ROOT_DIR / "server" / "static" / "alerts"
 ALERT_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Explicit operator approval is still required for production
-# automatic alerts. Never bypass detector validation.
+# automatic alerts. Never bypass detector validation in production.
 AUTO_ALERTS_APPROVED = (
     os.getenv("SMARTVISION_AUTO_ALERTS_APPROVED", "false")
     .strip()
     .lower()
     in {"1", "true", "yes", "on"}
 )
+
+# DEMO ONLY: skips detector validation/approval so phone alerts can be
+# demonstrated. Every alert is labeled as coming from an unvalidated
+# model. Leave this OFF (default) for any real use.
+DEMO_MODE = (
+    os.getenv("SMARTVISION_DEMO_MODE", "false")
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+DEMO_PREFIX = "[DEMO MODE - UNVALIDATED MODEL] " if DEMO_MODE else ""
+
+if DEMO_MODE:
+    logger.warning(
+        "DEMO MODE is ON: detector validation and approval checks "
+        "are bypassed. Do not use in production."
+    )
 
 _VALIDATION_CACHE_LOCK = threading.Lock()
 _VALIDATION_CACHE = {
@@ -125,7 +142,8 @@ def _notification_message(
     event_time = event_time.isoformat(timespec="seconds")
 
     return (
-        f"SmartVision security alert: {incident.threat_level}. "
+        f"{DEMO_PREFIX}SmartVision security alert: "
+        f"{incident.threat_level}. "
         f"Detected class: {detected_class}. "
         f"Confidence: {confidence}. "
         f"Camera: {incident.camera_id}. "
@@ -238,7 +256,29 @@ def _notification_policy():
 
     configuration_enabled = bool(settings.ALERTS_ENABLED)
 
-    if not model_validated:
+    if DEMO_MODE:
+        # Demo only: skip validation/approval checks, but still
+        # require a working phone notification transport.
+        if not configuration_enabled:
+            blocked_reason = (
+                "Phone notification configuration is disabled. "
+                "Set SMARTVISION_ALERTS_ENABLED=true to enable "
+                "ntfy transport."
+            )
+            blocked_status = "blocked_configuration"
+
+        elif transport_status != "ready":
+            blocked_reason = (
+                transport_error
+                or "The ntfy notification transport is not ready."
+            )
+            blocked_status = "blocked_configuration"
+
+        else:
+            blocked_reason = None
+            blocked_status = None
+
+    elif not model_validated:
         blocked_reason = (
             "Detector validation failed: "
             + "; ".join(validation.get("failures", []))
@@ -319,6 +359,7 @@ def _notification_policy():
         blocked_status = None
 
     return {
+        "demo_mode": DEMO_MODE,
         "transport_status": transport_status,
         "transport_error": transport_error,
         "notification_configuration_enabled": (
@@ -354,7 +395,8 @@ def _incident_notification_block(
     Determine whether an incident can be sent automatically.
 
     The client-side authorization flag is not required.
-    The server's complete production policy remains mandatory.
+    The server's complete production policy remains mandatory
+    (or the explicit demo-mode policy when DEMO_MODE is on).
     """
 
     if policy["blocked_status"] is not None:
@@ -479,7 +521,7 @@ def process_notifications(
     """
 
     msg = (
-        "SMARTVISION SECURITY ALERT\n"
+        f"{DEMO_PREFIX}SMARTVISION SECURITY ALERT\n"
         f"Threat: {incident.threat_level}\n"
         f"Detected class: "
         f"{incident.detected_class or incident.label}\n"
@@ -508,7 +550,7 @@ def process_notifications(
         try:
             email_service.send_email_alert(
                 subject=(
-                    f"SmartVision Threat Alert: "
+                    f"{DEMO_PREFIX}SmartVision Threat Alert: "
                     f"{incident.threat_level}"
                 ),
                 body=msg,
@@ -529,7 +571,7 @@ def deliver_incident_notification(
 ) -> None:
     """
     Deliver a persisted incident notification only when the
-    current server policy authorizes production delivery.
+    current server policy authorizes delivery.
     """
 
     db = (session_factory or database.SessionLocal)()
@@ -966,6 +1008,7 @@ def get_notification_status():
     policy = _notification_policy()
 
     return {
+        "demo_mode": policy["demo_mode"],
         "status": policy["transport_status"],
         "transport_status": policy["transport_status"],
         "transport_error": policy["transport_error"],
@@ -1061,6 +1104,7 @@ def health_check():
 
     return {
         "status": "running",
+        "demo_mode": notification_policy["demo_mode"],
         "database_status": database_status,
         "database_error": database_error,
         "notification_status": (
