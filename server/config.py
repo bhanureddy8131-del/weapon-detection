@@ -27,6 +27,7 @@ class Config:
     )
 
     ALERTS_ENABLED = _env_flag("SMARTVISION_ALERTS_ENABLED")
+    DEMO_ALERTS_APPROVED = _env_flag("SMARTVISION_DEMO_ALERTS_APPROVED")
     NTFY_TOPIC = os.getenv("SMARTVISION_NTFY_TOPIC", "").strip()
     NTFY_SERVER = os.getenv("SMARTVISION_NTFY_SERVER", "https://ntfy.sh").rstrip("/")
     ALERT_APPROVERS = frozenset(

@@ -173,13 +173,15 @@ smart-vision/
 - `DRAW_LABELS`: Enable text labels for detections.
 - `API_BASE_URL`: Incident API base (`SMARTVISION_API_BASE_URL`, default `http://127.0.0.1:8000/api/v1`).
 - `SERVER_URL`: Configured POST endpoint (`${API_BASE_URL}/incidents`). FastAPI entry point is `server.main:app`; the project starts it with `python -m uvicorn server.main:app --host 127.0.0.1 --port 8000`.
+- `SMARTVISION_FRAME_WIDTH` and `SMARTVISION_FRAME_HEIGHT`: Webcam capture request dimensions (defaults: `640x480`).
 - `SMARTVISION_ALERTS_ENABLED`: Explicit phone/legacy notification opt-in; defaults to `false`. Incident history is still stored while this is off.
 - `SMARTVISION_NTFY_TOPIC`: Private ntfy topic, read from the environment; it is never logged or included in error messages.
 - `SMARTVISION_DATABASE_PATH`: Optional SQLite file path. The default is the project-root `data/incidents.db`, shared by FastAPI regardless of its launch directory.
 - `SMARTVISION_ALERT_ENDPOINT_VERIFIED`: Separate operator gate; defaults to `false` and must only be enabled after checking the configured endpoint and its OpenAPI multipart contract.
+- `SMARTVISION_DEMO_ALERTS_APPROVED`: Separate, default-off opt-in for sending notifications from demo-mode incidents. Demo mode alone never enables notification delivery; use this only for a controlled demo.
 - `SMARTVISION_ALERT_RETRY_ATTEMPTS` and `SMARTVISION_ALERT_RETRY_BACKOFF_SECONDS`: Bounded retry controls (defaults: 3 attempts, 0.5 seconds exponential base; capped at 5 attempts and 2 seconds base).
 - `SMARTVISION_YOLO_MODEL_PATH`: Optional path to the trained YOLO checkpoint; defaults to `models/yolo11s_fine_tune_v3.pt`. If it is unavailable, the app reports that weapon detection is unavailable and may use `yolo11s.pt` for general object inference.
-- `YOLO_IMAGE_SIZE`: Inference size (`SMARTVISION_YOLO_IMAGE_SIZE`, default `416`; the dashboard allows changing it).
+- `YOLO_IMAGE_SIZE`: Inference size (`SMARTVISION_YOLO_IMAGE_SIZE`, default `320`; the dashboard allows changing it).
 - `YOLO_IOU_THRESHOLD`: YOLO NMS IoU threshold (`SMARTVISION_YOLO_IOU`, default `0.70`).
 - `SMARTVISION_CONFIDENCE_THRESHOLD`, `SMARTVISION_PERSON_CONFIDENCE`, `SMARTVISION_GUN_CONFIDENCE`, and `SMARTVISION_KNIFE_CONFIDENCE`: Detection thresholds. The UI can raise, but not lower, the configured global threshold.
 
@@ -191,7 +193,7 @@ When the custom file is absent, the app explicitly falls back to the generic 80-
 
 Threat incidents are sent to FastAPI on a bounded background queue and saved to the root-relative SQLite database independently of notification opt-in. The API validates threat levels against the project's rule outputs, persists detected class, confidence, track ID, event details, and notification status, and supports idempotent retries. The dashboard reads this same database through `GET /api/v1/incidents`; history survives restarts.
 
-Phone alerts use ntfy. Delivery requires all configured safeguards: a loaded and validated custom model, explicit sidecar production approval, `SMARTVISION_AUTO_ALERTS_APPROVED=true`, `SMARTVISION_ALERT_ENDPOINT_VERIFIED=true`, `SMARTVISION_ALERTS_ENABLED=true`, and a non-empty `SMARTVISION_NTFY_TOPIC`. `GET /api/v1/notifications/status` reports transport, configuration, runtime model, validation, approval, automatic-alert state, and a blocking reason separately. The server stores incidents whether delivery is allowed or blocked. Notification statuses distinguish `blocked_validation`, `blocked_operator_approval`, `blocked_configuration`, `pending`, `sent`, and `failed`; only an HTTP 2xx response is treated as sent. Connection and HTTP errors do not remove the incident. The ntfy request has a bounded timeout and runs after API persistence, outside video-frame inference.
+Phone alerts use ntfy. Production delivery requires all configured safeguards: a loaded and validated custom model, explicit sidecar production approval, `SMARTVISION_AUTO_ALERTS_APPROVED=true`, `SMARTVISION_ALERT_ENDPOINT_VERIFIED=true`, `SMARTVISION_ALERTS_ENABLED=true`, and a non-empty `SMARTVISION_NTFY_TOPIC`. Demo mode does not bypass notification gates; sending a demo-mode incident additionally requires the separate `SMARTVISION_DEMO_ALERTS_APPROVED=true` opt-in, a verified endpoint, enabled transport, and a configured topic. Demo incidents remain labeled as unvalidated. `GET /api/v1/notifications/status` reports transport, configuration, runtime model, validation, approval, automatic-alert state, and a blocking reason separately. The server stores incidents whether delivery is allowed or blocked. Notification statuses distinguish `blocked_validation`, `blocked_operator_approval`, `blocked_configuration`, `pending`, `sent`, and `failed`; only an HTTP 2xx response is treated as sent. Connection and HTTP errors do not remove the incident. The ntfy request has a bounded timeout and runs after API persistence, outside video-frame inference.
 
 To configure it from PowerShell, set the environment before launching both services (replace the topic placeholder locally; do not commit it):
 

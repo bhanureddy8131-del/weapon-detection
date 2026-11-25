@@ -32,6 +32,7 @@ from src.config import (
     WEBCAM_ID,
     ALERTS_ENABLED,
     ALERT_ENDPOINT_VERIFIED,
+    DEMO_ALERTS_APPROVED,
     CONFIDENCE_THRESHOLD,
     YOLO_IMAGE_SIZE,
     YOLO_IOU_THRESHOLD,
@@ -90,9 +91,8 @@ DISPLAY_SCALE = max(0.25, min(DISPLAY_SCALE, 1.0))
 # ---------------------------------------------------------------------
 
 # DEMO ONLY: must match SMARTVISION_DEMO_MODE on the server.
-# When ON, incidents are posted to the server without requiring a
-# validated detector. The server labels every alert as unvalidated.
-# Leave OFF (default) for any real use.
+# When ON, incidents are marked as unvalidated. It does not authorize
+# notification delivery; that needs a separate explicit opt-in.
 try:
     from dotenv import load_dotenv
 
@@ -115,6 +115,22 @@ DEMO_MODE = (
 def load_models():
     """Load YOLO, optional LSTM, device, and threat manager."""
 
+    has_mps = (
+        hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    )
+    if not torch.cuda.is_available() and not has_mps:
+        cpu_count = os.cpu_count() or 1
+        cpu_threads = max(1, min(4, cpu_count // 2))
+        if torch.get_num_threads() != cpu_threads:
+            torch.set_num_threads(cpu_threads)
+        logger.info(
+            "Configured CPU inference with %s PyTorch intra-op thread(s) "
+            "for %s logical CPU(s).",
+            cpu_threads,
+            cpu_count,
+        )
+
     detector = YOLODetector()
 
     try:
@@ -125,10 +141,7 @@ def load_models():
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
-    elif (
-        hasattr(torch.backends, "mps")
-        and torch.backends.mps.is_available()
-    ):
+    elif has_mps:
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
@@ -175,12 +188,13 @@ def load_models():
         )
 
     if DEMO_MODE:
-        # Demo only: skip the detector-validation requirement.
-        production_alerts_enabled = True
-
+        production_alerts_enabled = DEMO_ALERTS_APPROVED
         logger.warning(
-            "DEMO MODE is ON: alerts are sent without detector "
-            "validation. Do not use in production."
+            "DEMO MODE is ON. Demo notification delivery is %s by the "
+            "separate SMARTVISION_DEMO_ALERTS_APPROVED setting.",
+            "explicitly approved"
+            if DEMO_ALERTS_APPROVED
+            else "blocked",
         )
     else:
         production_alerts_enabled = (

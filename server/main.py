@@ -58,21 +58,21 @@ AUTO_ALERTS_APPROVED = (
     in {"1", "true", "yes", "on"}
 )
 
-# DEMO ONLY: skips detector validation/approval so phone alerts can be
-# demonstrated. Every alert is labeled as coming from an unvalidated
-# model. Leave this OFF (default) for any real use.
+# DEMO ONLY: skips detector validation/approval for incident handling.
+# Notification delivery still requires a separate explicit opt-in.
 DEMO_MODE = (
     os.getenv("SMARTVISION_DEMO_MODE", "false")
     .strip()
     .lower()
     in {"1", "true", "yes", "on"}
 )
+DEMO_ALERTS_APPROVED = settings.DEMO_ALERTS_APPROVED
 DEMO_PREFIX = "[DEMO MODE - UNVALIDATED MODEL] " if DEMO_MODE else ""
 
 if DEMO_MODE:
     logger.warning(
-        "DEMO MODE is ON: detector validation and approval checks "
-        "are bypassed. Do not use in production."
+        "DEMO MODE is ON: detector validation checks are bypassed. "
+        "Demo notification delivery requires separate approval."
     )
 
 _VALIDATION_CACHE_LOCK = threading.Lock()
@@ -257,9 +257,15 @@ def _notification_policy():
     configuration_enabled = bool(settings.ALERTS_ENABLED)
 
     if DEMO_MODE:
-        # Demo only: skip validation/approval checks, but still
-        # require a working phone notification transport.
-        if not configuration_enabled:
+        if not DEMO_ALERTS_APPROVED:
+            blocked_reason = (
+                "Demo notification delivery is disabled. Set "
+                "SMARTVISION_DEMO_ALERTS_APPROVED=true only for a "
+                "controlled demo."
+            )
+            blocked_status = "blocked_operator_approval"
+
+        elif not configuration_enabled:
             blocked_reason = (
                 "Phone notification configuration is disabled. "
                 "Set SMARTVISION_ALERTS_ENABLED=true to enable "
@@ -271,6 +277,13 @@ def _notification_policy():
             blocked_reason = (
                 transport_error
                 or "The ntfy notification transport is not ready."
+            )
+            blocked_status = "blocked_configuration"
+
+        elif not ALERT_ENDPOINT_VERIFIED:
+            blocked_reason = (
+                "The FastAPI alert endpoint has not been "
+                "explicitly verified."
             )
             blocked_status = "blocked_configuration"
 
@@ -360,6 +373,7 @@ def _notification_policy():
 
     return {
         "demo_mode": DEMO_MODE,
+        "demo_alerts_approved": DEMO_ALERTS_APPROVED,
         "transport_status": transport_status,
         "transport_error": transport_error,
         "notification_configuration_enabled": (
@@ -508,7 +522,7 @@ def _validate_threat_incident(
 
 
 # =========================================================
-# SECONDARY TELEGRAM AND EMAIL NOTIFICATIONS
+# TELEGRAM AND EMAIL NOTIFICATIONS
 # =========================================================
 
 def process_notifications(
@@ -516,8 +530,8 @@ def process_notifications(
     image_path: str | None = None,
 ) -> None:
     """
-    Send secondary Telegram/email notifications for incidents
-    already authorized by the server's notification policy.
+    Send Telegram/email notifications for incidents that have
+    already passed the server's notification authorization policy.
     """
 
     msg = (
@@ -539,11 +553,29 @@ def process_notifications(
                 f"({detection.confidence:.1%})\n"
             )
 
+    # Telegram delivery is independent of email delivery.
     try:
-        telegram_service.send_telegram_alert(msg, image_path)
+        telegram_sent = telegram_service.send_telegram_alert(
+            msg,
+            image_path,
+        )
+
+        if telegram_sent:
+            logger.info(
+                "Telegram alert successfully delivered for camera %s.",
+                incident.camera_id,
+            )
+        else:
+            logger.error(
+                "Telegram alert was not accepted for camera %s. "
+                "Check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.",
+                incident.camera_id,
+            )
+
     except Exception:
         logger.exception("Telegram notification failed.")
 
+    # Email is optional and remains independent.
     if incident.threat_level.strip().upper().startswith(
         ("CRITICAL", "HIGH")
     ):
@@ -556,12 +588,14 @@ def process_notifications(
                 body=msg,
                 image_path=image_path,
             )
+
+            logger.info("Email notification attempted.")
+
         except Exception:
             logger.exception("Email notification failed.")
 
-
 # =========================================================
-# PERSIST AND DELIVER PHONE NOTIFICATION
+# NTFY INCIDENT NOTIFICATION
 # =========================================================
 
 def deliver_incident_notification(
@@ -570,8 +604,10 @@ def deliver_incident_notification(
     session_factory=None,
 ) -> None:
     """
-    Deliver a persisted incident notification only when the
-    current server policy authorizes delivery.
+    Deliver ntfy notifications only when the current server
+    policy authorizes delivery.
+
+    Telegram is handled independently by process_notifications().
     """
 
     db = (session_factory or database.SessionLocal)()
@@ -594,7 +630,7 @@ def deliver_incident_notification(
             db.commit()
             return
 
-        # Recheck the complete policy at delivery time.
+        # Recheck authorization at delivery time.
         policy = _notification_policy()
 
         delivery_status, delivery_error = (
@@ -608,6 +644,12 @@ def deliver_incident_notification(
             incident.notification_status = delivery_status
             incident.notification_error = delivery_error
             db.commit()
+
+            logger.warning(
+                "ntfy notification blocked for incident %s: %s",
+                incident_id,
+                delivery_error,
+            )
             return
 
         incident.notification_status = "pending"
@@ -623,7 +665,7 @@ def deliver_incident_notification(
             db.commit()
 
             logger.error(
-                "Phone notification failed for incident %s: %s",
+                "ntfy delivery failed for incident %s: %s",
                 incident_id,
                 exc,
             )
@@ -634,12 +676,13 @@ def deliver_incident_notification(
         db.commit()
 
         logger.info(
-            "Phone notification sent for incident %s.",
+            "ntfy notification successfully delivered for incident %s.",
             incident_id,
         )
 
     except SQLAlchemyError:
         db.rollback()
+
         logger.exception(
             "Could not persist notification state for incident %s.",
             incident_id,
@@ -647,6 +690,7 @@ def deliver_incident_notification(
 
     except Exception:
         db.rollback()
+
         logger.exception(
             "Unexpected notification error for incident %s.",
             incident_id,
@@ -1009,6 +1053,7 @@ def get_notification_status():
 
     return {
         "demo_mode": policy["demo_mode"],
+        "demo_alerts_approved": policy["demo_alerts_approved"],
         "status": policy["transport_status"],
         "transport_status": policy["transport_status"],
         "transport_error": policy["transport_error"],
@@ -1039,17 +1084,17 @@ def get_notification_status():
     }
 
 
+# =========================================================
+# NOTIFICATION TEST - TELEGRAM + NTFY
+# =========================================================
+
 @app.post("/api/v1/notifications/test")
 def test_notification():
-    service_state, service_error = (
-        ntfy_service.notification_state()
-    )
+    """
+    Test Telegram and ntfy independently.
 
-    if service_state != "ready":
-        raise HTTPException(
-            status_code=409,
-            detail=service_error or "Notification service is not ready.",
-        )
+    This is a delivery test, not a confirmed threat.
+    """
 
     now = models.utc_now()
 
@@ -1058,26 +1103,126 @@ def test_notification():
 
     now = now.isoformat(timespec="seconds")
 
-    try:
-        ntfy_service.send_ntfy_notification(
-            "SmartVision test notification. "
-            f"Test delivery requested at {now}. "
-            "This is a delivery test, not a confirmed threat."
-        )
+    test_message = (
+        "SmartVision Pro notification test.\n"
+        f"Test delivery requested at {now}.\n"
+        "This is a delivery test, not a confirmed threat."
+    )
 
-    except ntfy_service.NtfyDeliveryError as exc:
-        logger.error("ntfy test notification failed: %s", exc)
-
-        raise HTTPException(
-            status_code=502,
-            detail=str(exc),
-        ) from exc
-
-    return {
-        "status": "sent",
-        "message": "ntfy accepted the test notification.",
+    results = {
+        "ntfy": {
+            "status": "failed",
+            "message": None,
+        },
+        "telegram": {
+            "status": "failed",
+            "message": None,
+        },
     }
 
+    # -----------------------------------------------------
+    # TEST NTFY
+    # -----------------------------------------------------
+
+    try:
+        service_state, service_error = (
+            ntfy_service.notification_state()
+        )
+
+        if service_state != "ready":
+            results["ntfy"]["message"] = (
+                service_error or "ntfy service is not ready."
+            )
+
+        else:
+            ntfy_service.send_ntfy_notification(test_message)
+
+            results["ntfy"] = {
+                "status": "sent",
+                "message": "ntfy accepted the test notification.",
+            }
+
+            logger.info("ntfy test notification accepted.")
+
+    except ntfy_service.NtfyDeliveryError as exc:
+        results["ntfy"]["message"] = str(exc)
+
+        logger.error("ntfy test notification failed: %s", exc)
+
+    except Exception:
+        results["ntfy"]["message"] = (
+            "Unexpected ntfy delivery error."
+        )
+
+        logger.exception("Unexpected ntfy test error.")
+
+    # -----------------------------------------------------
+    # TEST TELEGRAM
+    # -----------------------------------------------------
+
+    try:
+        telegram_sent = telegram_service.send_telegram_alert(
+            test_message,
+            image_path=None,
+        )
+
+        if telegram_sent:
+            results["telegram"] = {
+                "status": "sent",
+                "message": "Telegram accepted the test notification.",
+            }
+
+            logger.info("Telegram test notification accepted.")
+
+        else:
+            results["telegram"]["message"] = (
+                "Telegram did not accept the message. "
+                "Check bot credentials and chat ID."
+            )
+
+            logger.error("Telegram test notification was not accepted.")
+
+    except Exception:
+        results["telegram"]["message"] = (
+            "Unexpected Telegram delivery error."
+        )
+
+        logger.exception("Unexpected Telegram test error.")
+
+    # -----------------------------------------------------
+    # FINAL RESULT
+    # -----------------------------------------------------
+
+    successful_channels = [
+        channel
+        for channel, result in results.items()
+        if result["status"] == "sent"
+    ]
+
+    if len(successful_channels) == 2:
+        overall_status = "sent"
+
+    elif len(successful_channels) == 1:
+        overall_status = "partial"
+
+    else:
+        overall_status = "failed"
+
+    response = {
+        "status": overall_status,
+        "message": (
+            "Notification test completed."
+        ),
+        "channels": results,
+    }
+
+    if overall_status == "failed":
+        raise HTTPException(
+            status_code=502,
+            detail=response,
+        )
+
+    return response
 
 # =========================================================
 # HEALTH CHECK

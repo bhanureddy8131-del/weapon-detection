@@ -23,6 +23,7 @@ from pipeline.latest_frame_capture import LatestFrameCapture
 from pipeline.run_inference import (
     draw_weapon_boxes,
     get_canonical_class_id,
+    load_models,
     run_yolo_detection,
 )
 from scripts.prepare_detection_dataset import (
@@ -193,6 +194,25 @@ class LocalYOLOIntegrationTests(unittest.TestCase):
 
 
 class LivePipelineTests(unittest.TestCase):
+    def test_demo_mode_does_not_authorize_alerts_without_explicit_approval(self):
+        fake_detector = SimpleNamespace(
+            load_model=lambda _path: None,
+            alerts_enabled=True,
+        )
+        with (
+            patch("pipeline.run_inference.YOLODetector", return_value=fake_detector),
+            patch("pipeline.run_inference.DEMO_MODE", True),
+            patch("pipeline.run_inference.DEMO_ALERTS_APPROVED", False),
+            patch("src.core.threat_manager.ALERTS_ENABLED", True),
+            patch("src.core.threat_manager.ALERT_ENDPOINT_VERIFIED", True),
+        ):
+            detector, _, _, _, threat_manager = load_models()
+            try:
+                self.assertIs(detector, fake_detector)
+                self.assertFalse(threat_manager.alerts_enabled)
+            finally:
+                threat_manager.close()
+
     def test_custom_weapon_class_names_map_to_project_ids(self):
         detector = SimpleNamespace(
             class_names={

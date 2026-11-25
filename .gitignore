@@ -59,3 +59,47 @@ __pycache__/
 
 # Local backup files
 *.backup
+
+# Python environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Datasets
+The_final-4-detect/
+The_final-4/
+label_backups/
+
+# Training outputs
+runs/
+
+# Backup files
+backup_before_*/
+*.bak
+*.bak2
+*.bak3
+*.before_*
+
+# ZIP files
+*.zip
+
+# Logs
+*.log
+
+# Temporary scripts
+fix_pool.py
+fix_title.py
+patch_demo.py
+show_report.py
+test_alert.py
+train_local.py
+resume_smartvision_training.py
+
+# Temporary files
+*.txt

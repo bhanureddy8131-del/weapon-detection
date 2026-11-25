@@ -40,6 +40,10 @@ ALERT_ENDPOINT_VERIFIED = os.getenv(
     "SMARTVISION_ALERT_ENDPOINT_VERIFIED",
     "false",
 ).strip().lower() in {"1", "true", "yes", "on"}
+DEMO_ALERTS_APPROVED = os.getenv(
+    "SMARTVISION_DEMO_ALERTS_APPROVED",
+    "false",
+).strip().lower() in {"1", "true", "yes", "on"}
 ALERT_RETRY_ATTEMPTS = min(
     5,
     max(

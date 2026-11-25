@@ -77,6 +77,8 @@ def threat_payload(idempotency_key="test-event-key"):
 
 def ready_notification_policy():
     return {
+        "demo_mode": False,
+        "demo_alerts_approved": False,
         "transport_status": "ready",
         "transport_error": None,
         "notification_configuration_enabled": True,
@@ -312,6 +314,15 @@ class IncidentEndpointTests(unittest.TestCase):
         engine = create_test_engine()
         payload = threat_payload()
         payload["notification_authorized"] = False
+        policy = ready_notification_policy()
+        policy.update({
+            "production_alerts_approved": False,
+            "running_production_alerts_approved": False,
+            "automatic_alerts_approved": False,
+            "automatic_alerts_enabled": False,
+            "blocked_status": "blocked_operator_approval",
+            "blocked_reason": "Operator approval is missing.",
+        })
         try:
             with (
                 client_for_engine(engine) as (client, _),
@@ -319,7 +330,7 @@ class IncidentEndpointTests(unittest.TestCase):
                 patch.object(settings, "NTFY_TOPIC", "unit-test-topic"),
                 patch(
                     "server.main._notification_policy",
-                    return_value=ready_notification_policy(),
+                    return_value=policy,
                 ),
                 patch("server.main.process_notifications"),
                 patch(
@@ -529,12 +540,44 @@ class IncidentEndpointTests(unittest.TestCase):
             patch.object(settings, "ALERTS_ENABLED", False),
             patch("server.main.AUTO_ALERTS_APPROVED", True),
             patch("server.main.ALERT_ENDPOINT_VERIFIED", True),
+            patch("server.main.DEMO_MODE", False),
         ):
             policy = main._notification_policy()
 
         self.assertFalse(policy["notification_configuration_enabled"])
         self.assertFalse(policy["automatic_alerts_enabled"])
         self.assertEqual(policy["blocked_status"], "blocked_configuration")
+
+    def test_demo_mode_requires_separate_notification_approval(self):
+        validation = {
+            "passed": True,
+            "failures": [],
+            "production_alerts_approved": True,
+            "production_alerts_approval_invalid": False,
+            "record": {"checkpoint_sha256": "test-digest"},
+        }
+        runtime = {
+            "loaded": True,
+            "status": {
+                "model_validation_passed": True,
+                "production_alerts_approved": True,
+            },
+        }
+        with (
+            patch("server.main._detector_validation_status", return_value=validation),
+            patch("server.main.read_detector_status", return_value=runtime),
+            patch("server.main.ntfy_service.notification_state", return_value=("ready", None)),
+            patch.object(settings, "ALERTS_ENABLED", True),
+            patch("server.main.DEMO_MODE", True),
+            patch("server.main.DEMO_ALERTS_APPROVED", False),
+            patch("server.main.ALERT_ENDPOINT_VERIFIED", True),
+        ):
+            policy = main._notification_policy()
+
+        self.assertTrue(policy["demo_mode"])
+        self.assertFalse(policy["demo_alerts_approved"])
+        self.assertFalse(policy["automatic_alerts_enabled"])
+        self.assertEqual(policy["blocked_status"], "blocked_operator_approval")
 
     def test_incident_history_survives_database_reopen(self):
         with tempfile.TemporaryDirectory() as directory:
